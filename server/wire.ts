@@ -8,6 +8,7 @@
  * 结构块（thinking/toolCall）的丢弃，绝不改写正文字符。
  */
 
+import { displayAssistantText, extractScaffoldThinking } from "../src/postprocess.ts";
 import { isBackstageText } from "../src/stance.ts";
 import type { RpPanel } from "../src/panels.ts";
 import type { WorldState } from "../src/types.ts";
@@ -311,9 +312,17 @@ export function toWireMsg(m: unknown, names: WireNames, opts?: { backstage?: boo
 	if (msg.role === "assistant") {
 		// 纯工具/思考轮无正文：整条跳过（D9 同款判断）
 		if (!text) return null;
-		const thinking = thinkingOf(msg.content).trim();
 		const channel: WireChannel = opts?.backstage ? "backstage" : "narrative";
-		return thinking ? { channel, name: names.charName, text, thinking } : { channel, name: names.charName, text };
+		// 模型原生 thinking 块 + 预设假思维链（<thinking>/<draft_notes>…）折叠展示
+		const modelThinking = thinkingOf(msg.content).trim();
+		const scaffoldThinking = extractScaffoldThinking(text);
+		const thinking = [modelThinking, scaffoldThinking].filter(Boolean).join("\n\n").trim();
+		// 显示层剥脚手架（会话文件仍保留原文；cleanAssistantText 另管送模历史）
+		const display = channel === "narrative" ? displayAssistantText(text) : text;
+		if (!display && !thinking) return null;
+		return thinking
+			? { channel, name: names.charName, text: display || "（脚手架已折叠，见思维链）", thinking }
+			: { channel, name: names.charName, text: display };
 	}
 	if (msg.role === "custom") {
 		if (msg.display === false) return null; // rp-inject 等幕后注入

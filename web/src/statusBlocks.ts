@@ -14,6 +14,9 @@ export type StatusPart =
 export const STATUS_LABELS: Record<string, string> = {
 	normal_status: "场景状态",
 	special_status: "人物状态",
+	StatusBlock: "状态",
+	status_block: "状态",
+	statusblock: "状态",
 	plot: "剧情",
 	splot: "支线",
 	descriptive_analysis: "描写分析",
@@ -23,6 +26,9 @@ export const STATUS_LABELS: Record<string, string> = {
 const KNOWN_TAGS = [
 	"normal_status",
 	"special_status",
+	"StatusBlock",
+	"status_block",
+	"statusblock",
 	"plot",
 	"splot",
 	"descriptive_analysis",

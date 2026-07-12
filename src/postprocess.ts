@@ -93,8 +93,11 @@ export function displayAssistantText(text: string): string {
 	// 常见分隔标题（单独成行）
 	t = t.replace(/^\s*#{1,6}\s*正文\s*$/gim, "");
 	t = t.replace(/^\s*#{1,6}\s*(thinking|draft|notes?)\s*$/gim, "");
-	// 残留空标签行（勿误伤 StatusBlock 等有内容的块——只删整行空标签）
-	t = t.replace(/^\s*<\/?[A-Za-z][\w-]*\s*>\s*$/gm, "");
+	// 残留空标签行——但绝不能拆掉状态栏开闭标签（前端靠它们画面板）
+	t = t.replace(
+		/^\s*<\/?(?!(?:StatusBlock|status_block|statusblock|normal_status|special_status|status)\b)[A-Za-z][\w-]*\s*>\s*$/gim,
+		"",
+	);
 	return tidyWhitespace(t);
 }
 

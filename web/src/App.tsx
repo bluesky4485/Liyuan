@@ -60,6 +60,7 @@ import {
 	ChoiceCard,
 	MsgAvatar,
 	Paragraphs,
+	RichContent,
 	ThinkingBlock,
 	toolLabel,
 	type ChatMsg,
@@ -1464,7 +1465,7 @@ export default function App() {
 										<span className="msg-name msg-name-char">{charName}</span>
 									</div>
 									{streamThinking && <ThinkingBlock text={streamThinking} live={thinkingLive} />}
-									{streamText && <Paragraphs text={streamText} />}
+									{streamText && <RichContent text={streamText} />}
 									<span className="caret" />
 								</div>
 							)}

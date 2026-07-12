@@ -1044,7 +1044,8 @@ html[data-theme="dark"] [data-tip]:focus-visible::after {
 .st-block-body {
 	padding: 0 12px 10px;
 }
-.st-block-special_status {
+.st-block-special_status,
+.st-block-statusblock {
 	background: color-mix(in srgb, var(--accent, #bc4123) 8%, var(--surface, #fff));
 	border-color: color-mix(in srgb, var(--accent, #bc4123) 22%, transparent);
 }

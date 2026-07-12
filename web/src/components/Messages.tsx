@@ -9,7 +9,14 @@
 import { useEffect, useState } from "react";
 import { attachmentUrl, splitAttachments } from "../attachments.ts";
 import { splitHtmlParts } from "../htmlEmbed.ts";
-import { looksLikeYamlBlock, splitStatusParts, statusLabel, stripYamlFence } from "../statusBlocks.ts";
+import {
+	looksLikeYamlBlock,
+	splitStatusParts,
+	statusClassSuffix,
+	statusLabel,
+	stripOrphanStatusTags,
+	stripYamlFence,
+} from "../statusBlocks.ts";
 import type { WireActivity, WireChoice, WireMsg } from "../wire.ts";
 import { HtmlFrame } from "./HtmlFrame.tsx";
 import {
@@ -114,14 +121,21 @@ export function Paragraphs({ text }: { text: string }) {
 	);
 }
 
-/** 角色卡状态栏面板（normal_status / special_status 等） */
+/** 角色卡状态栏面板：只渲染 body，标题中文，永不露出 &lt;StatusBlock&gt; 字样 */
 function StatusPanel({ tag, body }: { tag: string; body: string }) {
 	const yaml = looksLikeYamlBlock(body);
-	const content = yaml ? stripYamlFence(body) : body;
+	const content = stripOrphanStatusTags(yaml ? stripYamlFence(body) : body);
+	const cls = statusClassSuffix(tag);
 	return (
-		<aside className={`st-block st-block-${tag}`} data-tag={tag}>
+		<aside className={`st-block st-block-${cls}`} data-kind={cls}>
 			<header className="st-block-head">{statusLabel(tag)}</header>
-			{yaml ? <pre className="st-block-yaml">{content}</pre> : <div className="st-block-body"><Paragraphs text={content} /></div>}
+			{yaml ? (
+				<pre className="st-block-yaml">{content}</pre>
+			) : (
+				<div className="st-block-body">
+					<Paragraphs text={content} />
+				</div>
+			)}
 		</aside>
 	);
 }
@@ -152,15 +166,20 @@ function TextWithHtml({ text }: { text: string }) {
 export function RichContent({ text }: { text: string }) {
 	const statusParts = splitStatusParts(text);
 	const onlyPlain =
-		statusParts.length === 1 && statusParts[0].kind === "text" && !splitHtmlParts(statusParts[0].text).some((p) => p.kind === "html");
+		statusParts.length === 1 &&
+		statusParts[0].kind === "text" &&
+		!splitHtmlParts(statusParts[0].text).some((p) => p.kind === "html");
 	if (onlyPlain) {
-		return <Paragraphs text={statusParts[0].kind === "text" ? statusParts[0].text : text} />;
+		const plain = statusParts[0].kind === "text" ? statusParts[0].text : text;
+		return <Paragraphs text={stripOrphanStatusTags(plain)} />;
 	}
 	return (
 		<>
 			{statusParts.map((p, i) => {
 				if (p.kind === "status") return <StatusPanel key={i} tag={p.tag} body={p.body} />;
-				if (p.kind === "text" && p.text.trim()) return <TextWithHtml key={i} text={p.text} />;
+				if (p.kind === "text" && p.text.trim()) {
+					return <TextWithHtml key={i} text={stripOrphanStatusTags(p.text)} />;
+				}
 				return null;
 			})}
 		</>

@@ -30,9 +30,13 @@ services:
       - liyuan-artifacts:/app/.liyuan-artifacts
       - liyuan-codex:/app/.liyuan-codex
       - liyuan-lore:/app/.liyuan-lore
-      # 可选：挂载自己的配置（取消注释并准备文件）
-      # - ./liyuan.agent.json:/app/liyuan.agent.json:ro
-      # - ./liyuan.config.json:/app/liyuan.config.json:ro
+      # 用户导入的角色卡 / 世界书 / 配置（重建镜像不丢）
+      # 首次：mkdir -p data/cards data/lorebooks data/config
+      #        并把 example 拷到 data/config/ 再 up
+      - ./data/cards:/app/assets/cards
+      - ./data/lorebooks:/app/assets/lorebooks
+      - ./data/config/liyuan.config.json:/app/liyuan.config.json
+      - ./data/config/liyuan.agent.json:/app/liyuan.agent.json
     healthcheck:
       test:
         [

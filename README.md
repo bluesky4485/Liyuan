@@ -230,3 +230,6 @@ node scripts/smoke-web.mjs     # Web 冒烟
 
 - 主项目采用 **[PolyForm Noncommercial 1.0.0](LICENSE)**：源码开放，个人与非商业用途可自由使用、修改、分发；**任何商业用途——包括但不限于倒卖、收费分发、付费托管服务——均不在许可范围内**，商业授权请单独联系作者。
 - `packages/` 下的 agent 内核 fork 自 [pi](https://github.com/earendil-works/pi)（MIT，Copyright Mario Zechner），保留其原协议与版权声明（各包目录内附 LICENSE）。
+
+##友链
+http://linux.do

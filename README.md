@@ -1,6 +1,6 @@
 # 梨园 Liyuan
 
-**基于pi内核的rp agent** 
+** AI Agent 为主体的角色扮演应用** 
 
 ![梨园主界面](docs/images/home.png)
 

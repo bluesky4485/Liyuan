@@ -9,6 +9,7 @@ packages/**/node_modules/
 !.liyuan/extensions/
 !.liyuan/extensions/**
 .liyuan-artifacts/
+.liyuan-assistant/
 .liyuan-cache/
 .liyuan-codex/
 .liyuan-lore/
@@ -36,8 +37,13 @@ liyuan-profiles/
 # logs / build noise
 *.log
 _web-*.log
+_test-*.txt
+_test-*.json
 web/tsconfig.tsbuildinfo
 **/*.tsbuildinfo
+
+# local generative / scratch assets
+assets/gen/
 
 # OS
 .DS_Store

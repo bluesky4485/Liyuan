@@ -198,31 +198,57 @@ export function ThinkingBlock({ text, live }: { text: string; live?: boolean }) 
 	);
 }
 
-/** 过程条 v0：本轮 agent 工作过程的折叠行（codex 式过程退场但可回看） */
+/** 过程条单项（工具调用 / 结果 / 中间旁白）——折叠态与实时清单共用 */
+function ActivityItem({ a }: { a: WireActivity }) {
+	if (a.kind === "note") {
+		return <li className="ta-note">{a.detail}</li>;
+	}
+	if (a.kind === "tool_start") {
+		return (
+			<li className="ta-call">
+				{toolLabel(a.name)}
+				{a.detail && <span className="ta-detail">{a.detail}</span>}
+			</li>
+		);
+	}
+	return (
+		<li className={`ta-result ${a.isError ? "ta-error" : ""}`}>
+			{a.isError ? "出错" : "结果"}
+			{a.detail && <span className="ta-detail">{a.detail}</span>}
+		</li>
+	);
+}
+
+/** 过程条（收尾态）：整轮步骤收进一个折叠（codex 式过程-成品分离，成品平铺在外） */
 export function ActivityBar({ activities }: { activities: WireActivity[] }) {
+	if (activities.length === 0) return null;
 	const calls = activities.filter((a) => a.kind === "tool_start").length;
-	if (calls === 0) return null;
+	const notes = activities.filter((a) => a.kind === "note").length;
 	return (
 		<details className="turn-activity">
 			<summary>
-				过程 · 工具调用 ×{calls}
+				过程
+				{calls > 0 && ` · 工具调用 ×${calls}`}
+				{notes > 0 && ` · 旁白 ×${notes}`}
 			</summary>
 			<ul>
-				{activities.map((a, i) =>
-					a.kind === "tool_start" ? (
-						<li key={i} className="ta-call">
-							{toolLabel(a.name)}
-							{a.detail && <span className="ta-detail">{a.detail}</span>}
-						</li>
-					) : (
-						<li key={i} className={`ta-result ${a.isError ? "ta-error" : ""}`}>
-							{a.isError ? "出错" : "结果"}
-							{a.detail && <span className="ta-detail">{a.detail}</span>}
-						</li>
-					),
-				)}
+				{activities.map((a, i) => (
+					<ActivityItem key={i} a={a} />
+				))}
 			</ul>
 		</details>
+	);
+}
+
+/** 过程清单（进行中态）：每一步实时追加、全程平铺可见；定稿后由 ActivityBar 收进折叠 */
+export function LiveSteps({ activities }: { activities: WireActivity[] }) {
+	if (activities.length === 0) return null;
+	return (
+		<ul className="live-steps">
+			{activities.map((a, i) => (
+				<ActivityItem key={i} a={a} />
+			))}
+		</ul>
 	);
 }
 

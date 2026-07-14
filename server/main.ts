@@ -13,7 +13,7 @@
 
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, statSync, unlinkSync, watch, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { networkInterfaces } from "node:os";
 import { dirname, extname, isAbsolute, join, normalize } from "node:path";
 import { WebSocketServer, type WebSocket } from "ws";
@@ -42,7 +42,13 @@ import {
 import { loadAgentConfig, normalizeAgentConfig, syncAgentConfigToRuntime } from "../src/agent-config.ts";
 import { loadCardFile } from "../src/card.ts";
 import { buildGreeting } from "../src/director.ts";
-import { activePanels, loadPanels, savePanels, writePanel } from "../src/panels.ts";
+import {
+	activePanels,
+	closePanel as closePanelInMap,
+	loadPanels,
+	savePanels,
+	writePanel,
+} from "../src/panels.ts";
 import {
 	DIRS,
 	dir,
@@ -82,9 +88,11 @@ import { handleApiRequest, type CurrentModelInfo, type RestHost } from "./rest.t
 // 并合并 fork 改名后遗留的 ~/.pi/agent（会话/配置，不覆盖更新的新树）
 const agentHome = preferLiyuanAgentHome();
 import {
+	assistantMediaOfToolResult,
 	isBackstageText,
 	parseCardFromSessionHead,
 	summarizeToolResult,
+	toAssistantHistory,
 	toWireHistory,
 	toWireMsg,
 	type ClientFrame,
@@ -92,6 +100,8 @@ import {
 	type WireNames,
 	type WireStats,
 } from "./wire.ts";
+import { stripBackstageMarker } from "../src/stance.ts";
+import { createAssistantHost, type AssistantHost, type StoryBridge } from "./assistant.ts";
 
 const cwd = process.cwd();
 const HOST = process.env.HOST ?? "0.0.0.0";
@@ -103,9 +113,8 @@ for (const line of migrateLegacyLayout(cwd)) {
 	console.log(`[liyuan] 迁移 ${line}`);
 }
 
-// 自操作接口地址：扩展在 session_start 读取并写进 system prompt（PLAN-PHASE3 §6.3，
-// agent 经 bash curl 操作本系统）。必须在 runtime 创建（扩展加载）之前设置。
-process.env.LIYUAN_HTTP = `http://localhost:${PORT}`;
+// 自操作接口（LIYUAN_HTTP → 剧情 system prompt）已退役（2026-07-14）：
+// 系统自操作整体移交右栏「助手」的工具面（server/assistant.ts），剧情模型不再 curl 自家 API。
 
 // Windows 环境修补（F3 实测缺陷，2026-07-10）：pi 以非登录模式启动 bash，PATH 里没有
 // Git 的 usr/bin，agent 的 bash 工具找不到 cat/sed/grep 等 coreutils（python3 还会撞上
@@ -698,7 +707,7 @@ const bindSession = async () => {
 				break;
 			}
 			case "message_end": {
-				const wire = toWireMsg(event.message, names, { backstage: backstageTurn });
+				const wire = toWireMsg(event.message, names);
 				// user 消息在 prompt 受理时已回显，这里跳过防重
 				if (wire && wire.channel !== "user") {
 					broadcast({ type: "message", message: wire });
@@ -950,6 +959,17 @@ const restHost: RestHost = {
 		}
 		return { imported, names, errors };
 	},
+	// 用户删除面板：同 agent panel_close（归档出活跃列表）+ panelsync 收编
+	closePanel(name) {
+		const file = join(artifactsDir, `${session.sessionId}.json`);
+		const panels = loadPanels(file);
+		const r = closePanelInMap(panels, name);
+		if (!r.ok) throw new Error(r.error);
+		savePanels(file, r.panels);
+		void handlePrompt("/panelsync").catch((err) => {
+			broadcast({ type: "error", text: err instanceof Error ? err.message : String(err) });
+		});
+	},
 	// 挂载知识库：与扩展 restoreCodexFromBranch 同规则——当前分支上最近的 rp-codex 快照
 	mountedCodexes() {
 		try {
@@ -1191,6 +1211,173 @@ try {
 	}
 } catch (err) {
 	console.error(`[liyuan] 启动同步 agent 配置失败：${err instanceof Error ? err.message : String(err)}`);
+}
+
+// ---------- 助手会话（右栏）：同进程第二 pi 会话（server/assistant.ts 托管） ----------
+//
+// 剧情会话与助手会话彻底分治：独立会话树（.liyuan-assistant/）、独立扩展集、独立模型。
+// 这里只做三件事：提供剧情桥（只读面 + 白名单写）、把助手事件翻成 assistant_* 帧、
+// 托管生命周期。启动失败不挡剧情（面板显示不可用）。
+
+const storyBridge: StoryBridge = {
+	storyMessages: () => session.messages as unknown[],
+	snapshot: () => ({
+		sessionId: session.sessionId,
+		cardName: names.charName,
+		userName: names.userName,
+		model: session.model ? { provider: session.model.provider, id: session.model.id } : null,
+		thinkingLevel: typeof session.thinkingLevel === "string" ? session.thinkingLevel : undefined,
+		contextPercent: safeStats()?.contextPercent ?? null,
+		messageCount: session.messages.length,
+		streaming: session.isStreaming,
+	}),
+	queueStoryCommand: (text) => restHost.queueCommand(text),
+	worldState: () => currentState(),
+	applyStatePatch: (patch) => restHost.applyStatePatch(patch),
+	softRefreshConfig: () => restHost.softRefreshConfig(),
+	listModels: () => {
+		const r = restHost.listModels();
+		return {
+			current: r.current ? { provider: r.current.provider, id: r.current.id, name: r.current.name } : null,
+			models: r.models.map((m) => ({
+				provider: m.provider,
+				providerName: m.providerName,
+				id: m.id,
+				name: m.name,
+				contextWindow: m.contextWindow,
+			})),
+		};
+	},
+	cardName: () => names.charName,
+	writePanels: (list) => restHost.importPanels(list),
+	deliverMedia: (absPath) => {
+		try {
+			if (!existsSync(absPath)) return { ok: false as const, error: `文件不存在：${absPath}` };
+			const ext = extname(absPath).toLowerCase();
+			const imageExt = [".png", ".jpg", ".jpeg", ".webp", ".gif", ".avif"];
+			const audioExt = [".mp3", ".wav", ".ogg", ".m4a", ".aac", ".flac"];
+			const videoExt = [".mp4", ".webm", ".mov", ".m4v", ".mkv", ".ogv"];
+			const kind = imageExt.includes(ext) ? "image" : audioExt.includes(ext) ? "audio" : videoExt.includes(ext) ? "video" : null;
+			if (!kind) return { ok: false as const, error: `不支持的媒体格式：${ext || "（无扩展名）"}` };
+			const mediaDir = dir(cwd, "media");
+			mkdirSync(mediaDir, { recursive: true });
+			const name = `${createHash("md5").update(readFileSync(absPath)).digest("hex").slice(0, 16)}${ext}`;
+			writeFileSync(join(mediaDir, name), readFileSync(absPath));
+			return { ok: true as const, src: `/media/${name}`, kind };
+		} catch (err) {
+			return { ok: false as const, error: err instanceof Error ? err.message : String(err) };
+		}
+	},
+	refreshStoryMaterials: () => restHost.softRefreshConfig(),
+	mountCodex: (name, on) => {
+		restHost.queueCommand(`/codexmount ${on ? "mount" : "unmount"} ${name}`);
+	},
+};
+
+let assistantHost: AssistantHost | null = null;
+
+const assistantHelloFrame = (): ServerFrame => ({
+	type: "assistant_hello",
+	messages: assistantHost ? toAssistantHistory(assistantHost.messages()) : [],
+	busy: assistantHost?.isStreaming() ?? false,
+	model: assistantHost?.modelInfo() ?? null,
+	follow: assistantHost?.follows() ?? true,
+});
+
+/** 助手会话事件 → assistant_* wire 帧（与剧情订阅同构，无 swipe/面板等剧情专属面） */
+const onAssistantEvent = (event: unknown) => {
+	const ev = event as {
+		type?: string;
+		willRetry?: boolean;
+		assistantMessageEvent?: { type?: string; delta?: string };
+		message?: { role?: string };
+		toolName?: string;
+		args?: unknown;
+		result?: unknown;
+		isError?: boolean;
+		attempt?: number;
+		maxAttempts?: number;
+	};
+	switch (ev.type) {
+		case "agent_start":
+			broadcast({ type: "assistant_state", state: "start" });
+			break;
+		case "agent_end":
+			if (!ev.willRetry) broadcast({ type: "assistant_state", state: "end" });
+			break;
+		case "message_update": {
+			const e = ev.assistantMessageEvent;
+			if (e?.type === "text_delta") broadcast({ type: "assistant_delta", kind: "text", delta: e.delta ?? "" });
+			else if (e?.type === "thinking_delta")
+				broadcast({ type: "assistant_delta", kind: "thinking", delta: e.delta ?? "" });
+			break;
+		}
+		case "message_end": {
+			// user 消息在受理时已回显；这里翻助手侧消息 + show_media 的媒体交付
+			if (ev.message?.role === "assistant") {
+				const list = toAssistantHistory([ev.message]);
+				if (list.length) broadcast({ type: "assistant_message", message: list[0] });
+			} else if (ev.message?.role === "toolResult") {
+				const media = assistantMediaOfToolResult(ev.message as never);
+				if (media) broadcast({ type: "assistant_message", message: media });
+			}
+			break;
+		}
+		case "tool_execution_start": {
+			let detail = "";
+			try {
+				detail = JSON.stringify(ev.args);
+				if (detail.length > 120) detail = `${detail.slice(0, 120)}…`;
+			} catch {
+				// 参数不可序列化则留空
+			}
+			broadcast({ type: "assistant_activity", activity: { kind: "tool_start", name: ev.toolName ?? "", detail } });
+			break;
+		}
+		case "tool_execution_end":
+			broadcast({
+				type: "assistant_activity",
+				activity: {
+					kind: "tool_end",
+					name: ev.toolName ?? "",
+					detail: summarizeToolResult(ev.result),
+					isError: ev.isError === true,
+				},
+			});
+			break;
+		case "auto_retry_start":
+			broadcast({
+				type: "notify",
+				level: "warning",
+				text: `助手模型请求失败，自动重试 ${ev.attempt}/${ev.maxAttempts}…`,
+			});
+			break;
+		default:
+			break;
+	}
+};
+
+/** 用户对助手发话（面板输入框 / 主输入框场外标记改道共用） */
+const promptAssistant = async (text: string) => {
+	if (!assistantHost) {
+		broadcast({ type: "notify", level: "warning", text: "助手不可用（启动失败或没有可用模型），剧情不受影响" });
+		return;
+	}
+	broadcast({ type: "assistant_message", message: { role: "user", text } });
+	await assistantHost.prompt(text);
+};
+
+try {
+	assistantHost = await createAssistantHost({
+		cwd,
+		bridge: storyBridge,
+		uiContext,
+		onEvent: onAssistantEvent,
+		onError: (text) => broadcast({ type: "error", text }),
+	});
+	console.log(`[liyuan] 助手会话已就位（${assistantHost.modelInfo() ? `${assistantHost.modelInfo()!.provider}/${assistantHost.modelInfo()!.id}` : "暂无模型"}${assistantHost.follows() ? "，跟随剧情模型" : ""}）`);
+} catch (err) {
+	console.error(`[liyuan] 助手会话启动失败（面板不可用，剧情不受影响）：${err instanceof Error ? err.message : String(err)}`);
 }
 
 // ---------- HTTP：REST /api/* + 托管 web/dist（存在时）+ 健康检查 ----------
@@ -1461,9 +1648,6 @@ const httpServer = createServer((req, res) => {
 
 const wss = new WebSocketServer({ server: httpServer, path: "/ws" });
 
-/** 当前轮是否戏外轮（用户输入带场外标记；决定助手回复的显示通道） */
-let backstageTurn = false;
-
 /** 发送用户输入（含斜杠命令；命令后全量对齐所有端） */
 const handlePrompt = async (text: string) => {
 	const trimmed = text.trim();
@@ -1518,13 +1702,18 @@ const handlePrompt = async (text: string) => {
 		return;
 	}
 
-	const backstage = isBackstageText(trimmed);
-	const isCommand = trimmed.startsWith("/") && !backstage;
+	// 场外标记 → 改道右栏助手会话（2026-07-14 职责拆分：剧情会话不再有戏内/戏外双姿态，
+	// 剧情模型只演戏；系统事务归助手。旧会话里遗留的戏外轮仅由 wire 历史渲染兜底。）
+	if (isBackstageText(trimmed)) {
+		await promptAssistant(stripBackstageMarker(trimmed));
+		return;
+	}
+
+	const isCommand = trimmed.startsWith("/");
 	if (!isCommand) {
-		backstageTurn = backstage;
 		broadcast({
 			type: "message",
-			message: { channel: "user", name: names.userName, text: trimmed, ...(backstage ? { backstage: true } : {}) },
+			message: { channel: "user", name: names.userName, text: trimmed },
 		});
 	}
 	// 流式中送达的用户输入排队到本轮结束（RP 语境：不打断正在进行的叙事）
@@ -1771,6 +1960,8 @@ wss.on("connection", (ws, req) => {
 	clients.add(ws);
 	ws.send(JSON.stringify(helloFrame()));
 	if (session.isStreaming) ws.send(JSON.stringify({ type: "agent", state: "start" } satisfies ServerFrame));
+	// 助手面板：连接即对齐（busy 随帧携带，断线重连恢复生成中状态）
+	ws.send(JSON.stringify(assistantHelloFrame()));
 	// 断线重连 / 新端接入：补发当前挂起的决策询问（未决卡不随 hello 历史走）
 	for (const [id, p] of pendingChoices) ws.send(JSON.stringify(choiceFrame(id, p)));
 
@@ -1840,6 +2031,44 @@ wss.on("connection", (ws, req) => {
 						}
 						break;
 					}
+					case "assistant_prompt": {
+						const t = String(frame.text ?? "").trim();
+						if (t) await promptAssistant(t);
+						break;
+					}
+					case "assistant_abort":
+						await assistantHost?.abort();
+						break;
+					case "assistant_new":
+						if (!assistantHost) return;
+						if (assistantHost.isStreaming()) {
+							ws.send(JSON.stringify({ type: "notify", level: "warning", text: "请等助手当前回复完成（或先停止），再开新对话" } satisfies ServerFrame));
+							return;
+						}
+						await assistantHost.newConversation();
+						broadcast(assistantHelloFrame());
+						break;
+					case "assistant_sync":
+						ws.send(JSON.stringify(assistantHelloFrame()));
+						break;
+					case "assistant_model": {
+						if (!assistantHost) return;
+						const provider = typeof frame.provider === "string" ? frame.provider.trim() : "";
+						const id = typeof frame.id === "string" ? frame.id.trim() : "";
+						try {
+							await assistantHost.setModel(provider && id ? { provider, id } : null);
+							broadcast(assistantHelloFrame());
+						} catch (err) {
+							ws.send(
+								JSON.stringify({
+									type: "notify",
+									level: "error",
+									text: err instanceof Error ? err.message : String(err),
+								} satisfies ServerFrame),
+							);
+						}
+						break;
+					}
 				}
 			} catch (err) {
 				broadcast({ type: "error", text: err instanceof Error ? err.message : String(err) });
@@ -1876,6 +2105,7 @@ const shutdown = async () => {
 		for (const ws of clients) ws.close();
 		wss.close();
 		httpServer.close();
+		await assistantHost?.dispose();
 		await runtime.dispose();
 	} finally {
 		process.exit(0);

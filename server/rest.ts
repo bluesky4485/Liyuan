@@ -196,6 +196,8 @@ export interface RestHost {
 		names: string[];
 		errors: string[];
 	};
+	/** 用户收起/删除面板（同 panel_close：归档出活跃列表，盘上保留，同名重写可重开） */
+	closePanel(name: string): void;
 	/** 当前剧情分支上挂载的知识库名（会话树 rp-codex 快照，随 rewind/fork 走） */
 	mountedCodexes(): string[];
 	// ---- 会话管理（PLAN-PANELS §2.1，main.ts 实现） ----
@@ -276,16 +278,16 @@ function sendJson(res: ServerResponse, code: number, obj: unknown): void {
 const resolvePath = (cwd: string, p: string) => (isAbsolute(p) ? p : join(cwd, p));
 
 /** 带 .bak 备份的 JSON 写盘（tab 缩进，与手写配置一致） */
-function writeJsonWithBackup(path: string, data: unknown): void {
+export function writeJsonWithBackup(path: string, data: unknown): void {
 	if (existsSync(path)) copyFileSync(path, `${path}.bak`);
 	writeFileSync(path, JSON.stringify(data, null, "\t") + "\n", "utf8");
 }
 
 // ---------- 配置读写 ----------
 
-const configPath = (cwd: string) => resolveConfigPath(cwd);
+export const configPath = (cwd: string) => resolveConfigPath(cwd);
 
-function loadConfig(cwd: string): RpConfig {
+export function loadConfig(cwd: string): RpConfig {
 	const p = configPath(cwd);
 	if (!existsSync(p)) return { ...DEFAULT_CONFIG };
 	const raw = { ...DEFAULT_CONFIG, ...(JSON.parse(readFileSync(p, "utf8")) as Partial<RpConfig>) };
@@ -310,9 +312,10 @@ const CONFIG_EDITABLE = new Set([
 	"disabledLore",
 	"backendControl",
 	"creationMode",
+	"assistantModel",
 ]);
 
-function applyConfigPatch(config: RpConfig, patch: Record<string, unknown>): RpConfig {
+export function applyConfigPatch(config: RpConfig, patch: Record<string, unknown>): RpConfig {
 	const next = { ...config } as Record<string, unknown>;
 	for (const [k, v] of Object.entries(patch)) {
 		if (!CONFIG_EDITABLE.has(k)) continue;
@@ -330,6 +333,22 @@ function applyConfigPatch(config: RpConfig, patch: Record<string, unknown>): RpC
 	next.greeting = next.greeting === true;
 	// 决策门禁档位：只认 ask / silent；非法值删除（扩展缺省按 silent）
 	if (next.creationMode !== "ask" && next.creationMode !== "silent") delete next.creationMode;
+	// 助手模型：只认 { provider, id } 形；非法值删除（缺省=跟随剧情模型）
+	if (next.assistantModel !== undefined) {
+		const am = next.assistantModel as { provider?: unknown; id?: unknown } | null;
+		if (
+			!am ||
+			typeof am !== "object" ||
+			typeof am.provider !== "string" ||
+			!am.provider ||
+			typeof am.id !== "string" ||
+			!am.id
+		) {
+			delete next.assistantModel;
+		} else {
+			next.assistantModel = { provider: am.provider, id: am.id };
+		}
+	}
 	// 挂载书：lorebooks 数组优先；兼容旧单本 lorebook
 	const paths = mountedLorebookPaths(next as RpConfig);
 	Object.assign(next, setMountedLorebooks(next as RpConfig, paths));
@@ -377,7 +396,7 @@ function loadMergedLoreWithSource(
 	return { entries, sourceOf, cardName: card.name, paths };
 }
 
-function loadMergedLore(cwd: string, config: RpConfig): LorebookEntry[] {
+export function loadMergedLore(cwd: string, config: RpConfig): LorebookEntry[] {
 	return loadMergedLoreWithSource(cwd, config).entries;
 }
 
@@ -654,7 +673,7 @@ function validatePresetPath(p: string): string {
 	return norm;
 }
 
-function presetOverridePath(cwd: string): string {
+export function presetOverridePath(cwd: string): string {
 	return join(cwd, PRESET_OVERRIDE_REL);
 }
 
@@ -670,7 +689,7 @@ function clearPresetOverride(cwd: string): void {
 }
 
 /** 磁盘上的已保存预设（不含草稿） */
-function loadDiskPreset(cwd: string): { path: string; preset: RpPreset } | null {
+export function loadDiskPreset(cwd: string): { path: string; preset: RpPreset } | null {
 	const config = loadConfig(cwd);
 	if (!config.preset) return null;
 	const p = resolvePath(cwd, config.preset);
@@ -679,7 +698,7 @@ function loadDiskPreset(cwd: string): { path: string; preset: RpPreset } | null 
 }
 
 /** 运行时生效：草稿优先，否则磁盘 */
-function loadEffectivePreset(cwd: string): { path: string | null; preset: RpPreset | null; fromOverride: boolean } {
+export function loadEffectivePreset(cwd: string): { path: string | null; preset: RpPreset | null; fromOverride: boolean } {
 	const config = loadConfig(cwd);
 	if (!config.preset) return { path: null, preset: null, fromOverride: false };
 	const ovr = presetOverridePath(cwd);
@@ -699,7 +718,7 @@ function loadEffectivePreset(cwd: string): { path: string | null; preset: RpPres
 	return { path: disk.path, preset: disk.preset, fromOverride: false };
 }
 
-function mergePresetPatches(
+export function mergePresetPatches(
 	base: RpPreset,
 	body: {
 		samplers?: Record<string, number>;
@@ -1371,6 +1390,15 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
 					host.notify("info", `已导入 ${result.imported} 个面板${result.errors.length ? `（${result.errors.length} 个失败）` : ""}`);
 				}
 				sendJson(res, result.imported > 0 ? 200 : 400, { ok: result.imported > 0, ...result });
+				return true;
+			}
+			// 用户从面板坞删除：同 agent panel_close（归档，出活跃列表；fs.watch + panelsync）
+			case "DELETE /api/panels": {
+				const name = (query.get("name") ?? "").trim();
+				if (!name) throw new Error("缺少 name");
+				host.closePanel(name);
+				host.notify("info", `已删除面板「${name}」`);
+				sendJson(res, 200, { ok: true, name });
 				return true;
 			}
 

@@ -2,10 +2,11 @@
  * 面板坞：agent 自建面板清单（顶栏中央「面板」下拉内容）。
  */
 
-import { useRef } from "react";
-import { apiPost } from "../api.ts";
+import { useRef, useState } from "react";
+import { apiDelete, apiPost } from "../api.ts";
 import type { RpPanel } from "../wire.ts";
-import { IconDownload } from "./icons.tsx";
+import { IconDownload, IconTrash } from "./icons.tsx";
+import { ConfirmButton } from "./kit.tsx";
 
 const KIND_LABEL: Record<string, string> = { markdown: "文档", svg: "图形", html: "网页" };
 
@@ -27,6 +28,7 @@ export function PanelDock({
 	activeAgent = null,
 }: PanelDockProps) {
 	const fileRef = useRef<HTMLInputElement>(null);
+	const [busy, setBusy] = useState(false);
 
 	const exportPanels = (list: RpPanel[], label: string) => {
 		const data = {
@@ -55,6 +57,19 @@ export function PanelDock({
 		}
 	};
 
+	const removePanel = async (name: string) => {
+		if (busy) return;
+		setBusy(true);
+		try {
+			await apiDelete(`/api/panels?name=${encodeURIComponent(name)}`);
+			// 成功 toast 由 REST notify 推送；列表经 WS panels 帧更新
+		} catch (err) {
+			toast("error", err instanceof Error ? err.message : String(err));
+		} finally {
+			setBusy(false);
+		}
+	};
+
 	return (
 		<div className={`panel-dock-body panel-dock-${variant}`}>
 			<div className="field-hint" style={{ marginBottom: 10 }}>
@@ -79,6 +94,16 @@ export function PanelDock({
 						>
 							<IconDownload size={14} />
 						</button>
+						<ConfirmButton
+							className="dock-act"
+							disabled={busy}
+							title="删除此面板"
+							aria-label={`删除面板「${p.name}」`}
+							confirmText="确认删除"
+							onConfirm={() => void removePanel(p.name)}
+						>
+							<IconTrash size={14} />
+						</ConfirmButton>
 					</div>
 				))}
 			</div>

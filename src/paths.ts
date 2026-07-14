@@ -23,6 +23,8 @@ export const PRESET_FILE_LEGACY = "rp-preset.json";
 export const DIRS = {
 	state: ".liyuan-state",
 	artifacts: ".liyuan-artifacts",
+	/** 右栏「助手」的独立会话树（绝不进剧情会话列表/世界线） */
+	assistant: ".liyuan-assistant",
 	cache: ".liyuan-cache",
 	codex: ".liyuan-codex",
 	lore: ".liyuan-lore",
@@ -36,6 +38,7 @@ export const DIRS = {
 const LEGACY_DIRS: Record<keyof typeof DIRS, string> = {
 	state: ".rp-state",
 	artifacts: ".rp-artifacts",
+	assistant: ".rp-assistant", // 从未存在过（2026-07 新增目录），迁移恒空转
 	cache: ".rp-cache",
 	codex: ".rp-codex",
 	lore: ".rp-lore",

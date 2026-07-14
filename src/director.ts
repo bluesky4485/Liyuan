@@ -20,15 +20,13 @@ export interface DirectorOptions {
 	constantLore: LorebookEntry[];
 	/** 预设 system 区块（转换自 ST 预设，原样搬运、按原序；D8：会话内字节稳定） */
 	presetSystemBlocks?: PresetBlock[];
-	/** 本系统自身 HTTP 接口的 base URL（Web 宿主注入；TUI 模式缺省）——backendControl 开时写进提示词，agent 可自操作 */
-	selfApiBase?: string;
 	/** 技能库索引（session_start 时装载；D8：会话内字节稳定） */
 	skills?: SkillMeta[];
 	/** MCP 外设索引正文（formatMcpIndex 产出；session_start 装载，D8 字节稳定） */
 	mcpIndex?: string;
 }
 
-export function buildSystemPrompt({ card, config, constantLore, presetSystemBlocks, selfApiBase, skills, mcpIndex }: DirectorOptions): string {
+export function buildSystemPrompt({ card, config, constantLore, presetSystemBlocks, skills, mcpIndex }: DirectorOptions): string {
 	const macro: MacroContext = { charName: card.name, userName: config.userName };
 	const m = (s: string) => applyMacros(s, macro);
 	const sections: string[] = [];
@@ -37,23 +35,10 @@ export function buildSystemPrompt({ card, config, constantLore, presetSystemBloc
 		`# 任务
 你在进行一场长篇沉浸式角色扮演。你扮演 ${card.name}（以及剧情需要的一切配角、路人与世界本身），用户扮演 ${config.userName}。这不是问答服务，而是一场共同创作的连续剧情。
 
-# 双重职责（戏内 / 戏外）——剧情永远戏内
-你是同一个 agent，两种姿态，边界如下：
-
-## 戏内（剧情通道——默认）
-- **凡与剧情有关的，一律戏内。** 包括：推进场面、角色互动，以及「我该怎么办」「下一步怎么走」「开始生成身份」「你觉得该选哪条」——这些都是**剧情内的抉择/共创**，不是系统客服。
-- 戏内要用户拍板时（求方向、生成身份人设、关键定型）：调用 ask_director 弹**戏内选择卡**，再用所选方向继续扮演。禁止助手口吻代写完整身份档案、禁止「我先用导演选项帮你拍板」这类场外话。
-- 用户消息**没有**场外标记时，也一律按戏内处理（见下）。
-
-## 戏外（系统通道——不管剧情）
-- **戏外根本不处理剧情。** 不讨论走向、不定角色性格、不替用户选剧情分支、不写场面。
-- 戏外只做：系统/工具/配置/查资料/本机操作等**非剧情**事务。
-- 触发条件（须同时满足）：用户带了显式标记（// 开头、（（/(( 开头、或整条（）/() 包裹），**且**内容是非剧情事务。若带了标记但其实在谈剧情——仍按戏内处理（选择卡或续演），不要用助手姿态聊剧情。
-
-## 硬规则（摘要）
-1. 剧情相关 → 戏内（无例外）。
-2. 无场外标记 → 戏内。
-3. 戏外 = 有标记 + 非剧情办事；戏外不染指剧情。`,
+# 职责边界：你只负责剧情
+系统与工具事务（改配置、调预设、换模型、接外部服务、修记忆账本）由界面里独立的「助手」负责，不归你管。
+- 用户消息一律当剧情输入处理。「我该怎么办」「下一步怎么走」「开始生成身份」「你觉得该选哪条」都是剧情内的抉择与共创，不是系统求助——不要用助手口吻回应。
+- 用户在剧情输入里明确要求系统操作时（改配置、调模型之类）：不要自己动手，也不要写进剧情正文——用一句括号包裹的简短说明请他找输入框右边的「助手」，然后等剧情输入。`,
 	);
 
 	const charParts: string[] = [`# 你扮演的角色：${card.name}`];
@@ -115,9 +100,9 @@ export function buildSystemPrompt({ card, config, constantLore, presetSystemBloc
 	if (config.backendControl !== false) {
 		toolLines.push(
 			`通用工具（bash / read / write 等，可操作本机）：`,
-			`- 戏内：仅在用户明确要求时使用（如「给这个场景生成一张图」「查一下××」），完成后把结果自然融入回应，不打断叙事节奏。`,
-			`- 戏外：自由使用，这是你替用户办事的手脚。面对陌生的本机服务（用户的其他项目），像工程师一样自己探索：找端口、读文档、试接口。`,
-			`- 【纪律】覆盖或删除文件、更改配置等不可逆操作，先向用户说明并得到确认再执行；绝不主动读取或外传密钥类文件。`,
+			`- 仅在用户明确要求、且服务于当前剧情时使用（如「给这个场景生成一张图」「查一下××」），完成后把结果自然融入回应，不打断叙事节奏。`,
+			`- 优先照技能库笔记调用（见技能库一节）。没有对应技能的陌生服务不要在剧情中途自己摸索——请用户找输入框右边的「助手」接通。`,
+			`- 【纪律】覆盖或删除文件等不可逆操作，先向用户说明并得到确认再执行；绝不主动读取或外传密钥类文件。`,
 		);
 	}
 	toolLines.push(`状态账本有后台自动记录最终兜底——【世界状态】给出的事实（物品归属、时间、地点、关系）必须遵守。`);
@@ -126,8 +111,8 @@ export function buildSystemPrompt({ card, config, constantLore, presetSystemBloc
 	// 决策门禁（PLAN-PHASE4 柱 1）：仅 ask 档。范围含「求方向」与关键转折；仍禁止正文手写选项。
 	if (config.creationMode === "ask") {
 		sections.push(
-			`# 决策门禁（戏内共创——必须用 ask_director）
-这场剧情由你和${config.userName}共同创作。下列情况**先别定死写进正文**——调用 ask_director 停笔，给出 2~4 个具体选项问${config.userName}，等答后再落笔。选择卡是**戏内**机制，不是场外助手。
+			`# 决策门禁（剧情共创——必须用 ask_director）
+这场剧情由你和${config.userName}共同创作。下列情况**先别定死写进正文**——调用 ask_director 停笔，给出 2~4 个具体选项问${config.userName}，等答后再落笔。选择卡是剧情共创机制，答完继续演。
 
 ## 必须问（优先——本轮第一步就 ask_director）
 - **用户求方向 / 把笔递给你**：「该做什么」「怎么办」「怎么走」「下一步呢」「你觉得呢」「让我选」「给个选项」等——哪怕嵌在角色内心独白或动作描写里——用场景内可执行的走法做选项，禁止只写叙事替他选完。
@@ -147,14 +132,13 @@ export function buildSystemPrompt({ card, config, constantLore, presetSystemBloc
 		);
 	}
 
-	// 技能库（PLAN-PHASE3 §6.4）：agent 自写的外部服务调用笔记；调用外部服务离不开 bash，故只在 backendControl 开时注入
+	// 技能库（PLAN-PHASE3 §6.4）：调用笔记的「使用」留在剧情侧；「摸索与沉淀」归右栏助手（2026-07-14 拆分）
 	if (config.backendControl !== false) {
 		sections.push(
 			`# 技能库
-.liyuan-skills/ 里存着你（或之前的你）摸通外部服务后写下的调用笔记。用户要求调用外部服务（生图、TTS、任何本机/远程 API）时：
+.liyuan-skills/ 里是摸通外部服务后沉淀的调用笔记（由「助手」维护，你也能用）。用户在剧情中要求调用外部服务（生图、TTS、任何本机/远程 API）时：
 - 先看下面的技能清单：有对应技能就先用 read 读该文件，按笔记直接调用，不要重新摸索。
-- 清单里没有才从头探索（找端口、读文档、试接口）。
-- 摸通一个新服务后，或用户把服务地址/密钥交给你并要求保存时，立即用 skill_save 沉淀为技能：写清 endpoint、认证方式、请求格式、一条验证过的 curl 示例与注意事项——下次一步到位。同名保存即更新。
+- 清单里没有：如实告诉用户该服务还没接通，请他到输入框右边的「助手」处接通——助手摸通后会沉淀成技能，此后你可直接照用。
 当前技能清单：
 ${formatSkillIndex(skills ?? [])}`,
 		);
@@ -173,19 +157,8 @@ ${mcpIndex}`,
 		);
 	}
 
-	// 自身系统的操作接口：Web 宿主在运行时注入 base URL（D8：会话内该值不变，字节稳定）
-	if (config.backendControl !== false && selfApiBase) {
-		sections.push(
-			`# 本系统的自操作接口
-这套 RP 系统自身运行着本地 HTTP 接口（${selfApiBase}），你可以用 bash curl 操作它——用户要求的系统操作尽量走这里，而不是让用户自己去点界面：
-- 剧情结构（仅在用户明确要求时）：POST ${selfApiBase}/api/command，体如 {"text":"/rewind 2"}。可用命令：/rewind N（回退 N 个剧情轮；戏外问答轮不计入 N）、/branch（当前点开分支）、/reroll（重新生成上一轮）、/compact（压缩较早对话为剧情摘要）。流式中提交会自动排队到本轮结束执行。
-- 配置（改前先向用户复述变更并确认）：GET ${selfApiBase}/api/config 查看（响应形如 {"config":{"scanDepth":4,…}}）；PUT 同地址提交增量 JSON（如 {"scanDepth":6}）。
-- 模型（改前确认）：GET ${selfApiBase}/api/models 列可用；POST ${selfApiBase}/api/models/select 体 {"provider":"…","id":"…"}。
-- 只读查询随时可用：GET /api/lorebook、/api/lorebook/search?q=…、/api/preset、/api/card。
-- curl 示例：curl -s -X POST ${selfApiBase}/api/command -H "content-type: application/json" -d "{\\"text\\":\\"/rewind 2\\"}"
-- 【禁区】永不调用 /api/auth（密钥管理只属于用户本人）。`,
-		);
-	}
+	// 自操作接口已退役（2026-07-14）：系统自操作整体移交右栏「助手」的工具面
+	// （story_command / config_write / preset_toggle 等），剧情模型不再持有 curl 自家 API 的权限。
 
 	sections.push(
 		`# 消息流约定
@@ -207,9 +180,10 @@ ${mcpIndex}`,
 }
 
 /**
- * 用户本轮是否在「求方向 / 要共创定型 / 把笔递出」（戏内强制 ask_director）。
+ * 用户本轮是否在「求方向 / 要共创定型 / 把笔递出」（ask 档升格强制 ask_director）。
  * 命中时 harness 在末端钉「第一个动作必须是 ask_director」——不只靠模型自觉。
- * 无场外标记的前提下使用；短句/内心独白末句带这些也算。
+ * 场外标记消息不会进剧情会话（已在 server 层改道助手），无需在此排除；
+ * 短句/内心独白末句带这些也算。
  *
  * 注意：弹窗仍由模型调用 ask_director 触发；本函数只决定是否升格为强制提示。
  * 身份/人设生成与「怎么办」同等对待——直接代写完整档案不算完成任务。
@@ -246,8 +220,6 @@ export interface TurnInjectionOptions {
 	activatedLore: LorebookEntry[];
 	card: CharacterCard;
 	config: RpConfig;
-	/** 本轮工作姿态（PLAN-PHASE3 §6.1）：backstage=用户带场外标记（//、括号包裹）对助手说话 */
-	stance?: "onstage" | "backstage";
 	/** 上一轮助手正文语言与 config.language 不符（harness 检测，用于纠正提醒） */
 	languageMismatch?: boolean;
 	/** 审计器发现的上一轮正文与账本的矛盾（注入提醒，正文由用户决定是否重演——D10） */
@@ -260,7 +232,7 @@ export interface TurnInjectionOptions {
 	codexIndex?: string;
 	/** 上传区速览（formatUploadIndex 产出，如「地图.png(2MB)、笔记.txt(3KB)」）；空文件夹缺省 */
 	uploadIndex?: string;
-	/** 本轮用户原文（用于求方向检测；戏内 ask 档） */
+	/** 本轮用户原文（用于求方向检测；ask 档） */
 	userText?: string;
 }
 
@@ -270,7 +242,6 @@ export function buildTurnInjection({
 	activatedLore,
 	card,
 	config,
-	stance,
 	languageMismatch,
 	presetPostHistoryBlocks,
 	panelIndex,
@@ -287,7 +258,6 @@ export function buildTurnInjection({
 	);
 
 	// 活跃面板速览（柱 2）：让模型每轮都记得自己建过哪些面板——建了不更新的面板比没有更糟。
-	// 戏内戏外都注入（戏外办事也可能要动面板）。
 	if (panelIndex) {
 		blocks.push(`【活跃面板】${panelIndex}——其中的事实有变时用 panel_write 及时更新；不再需要的用 panel_close 收起。`);
 	}
@@ -300,7 +270,6 @@ export function buildTurnInjection({
 	}
 
 	// 上传区速览：用户上传的素材文件（.rp-uploads/），harness 保证模型知道文件夹里有什么。
-	// 戏内戏外都注入（消息尾的附件路径只在当轮，速览让后续轮次也找得到文件）。
 	if (uploadIndex) {
 		blocks.push(
 			`【上传文件】${uploadIndex}——用户上传的素材，在 .liyuan-uploads/ 下，新的在前。用户提到"我传的图/文件"时用 read 查看（视觉模型 read 图片即可看见画面；非视觉模型 read 会提示不支持，此时不要臆测图片内容，如实说明看不到）。`,
@@ -314,21 +283,12 @@ export function buildTurnInjection({
 		blocks.push(`【相关设定】\n${lore}`);
 	}
 
-	// 预设 post-history 块：ST 语义中最贴近生成点的用户自备指令，排在导演备注之前（叙事工艺，戏外轮不注入）
-	if (stance !== "backstage" && presetPostHistoryBlocks && presetPostHistoryBlocks.length > 0) {
+	// 预设 post-history 块：ST 语义中最贴近生成点的用户自备指令，排在导演备注之前
+	if (presetPostHistoryBlocks && presetPostHistoryBlocks.length > 0) {
 		const sorted = [...presetPostHistoryBlocks].sort(
 			(a, b) => (b.depth ?? 0) - (a.depth ?? 0), // depth 大者更早出现（离末端更远）
 		);
 		blocks.push(`【预设末端指令】\n${sorted.map((b) => applyMacros(b.content, macro)).join("\n\n")}`);
-	}
-
-	// 戏外轮：末端备注换成助手姿态；世界状态与设定照常注入（它们是办事的资料）。
-	// 语言纠正与审计提醒是叙事专用，不在戏外轮消费（由调用方保留到下一个戏内轮）。
-	if (stance === "backstage") {
-		blocks.push(
-			`【导演备注】\n本轮用户在戏外对你说话（场外标记）。放下角色，以助手姿态直接回应或用工具办事，不写剧情正文；完成后简洁报告。回复语言：${config.language}。\n办事纪律：探测/调用外部服务必须用工具实测（curl、读文件），不要在思考里推演或臆测结果；你的思考过程在后续轮次不可见，且一段时间后本轮的工具原始返回也会被清理——凡需要留存的结论（端点、参数、成败与原因）必须写进回复正文；摸通的调用方法立即用 skill_save 沉淀。`,
-		);
-		return blocks.join("\n\n");
 	}
 
 	// 末端导演备注：上下文末尾的指令权重最大（ST 的 post-history instructions 同理）。
@@ -339,7 +299,7 @@ export function buildTurnInjection({
 	}
 	notes.push(`以${config.language}继续叙事与对白（专有名词可保留原文）；不替 ${config.userName} 行动、说话或代述想法。`);
 	notes.push(
-		`剧情相关一律戏内（含怎么办/下一步）；禁止助手口吻聊剧情。戏外只办非剧情系统事，且须有场外标记。`,
+		`用户消息一律是剧情输入（含怎么办/下一步这类抉择）；禁止助手口吻聊剧情。系统与工具事务不归你管，指给输入框右边的「助手」。`,
 	);
 	notes.push(
 		`正文字数只计用户可见叙事（约 800–1500 字，短打可约 400）；draft_notes/思维链/StatusBlock 不计字，勿靠它们凑篇幅。`,
@@ -355,16 +315,16 @@ export function buildTurnInjection({
 				);
 			if (identity) {
 				notes.push(
-					`⚠ 强制（戏内）：用户在要求生成/定型身份或人设。你的**第一个动作必须是 ask_director**——用选择卡让用户拍板关键项（如出身、职业、性格基调、与主角关系等 2~4 个具体选项，或几套可点选的身份草案）；工具返回前禁止直接代写完整身份档案正文，禁止助手口吻清单式填表。`,
+					`⚠ 强制：用户在要求生成/定型身份或人设。你的**第一个动作必须是 ask_director**——用选择卡让用户拍板关键项（如出身、职业、性格基调、与主角关系等 2~4 个具体选项，或几套可点选的身份草案）；工具返回前禁止直接代写完整身份档案正文，禁止助手口吻清单式填表。`,
 				);
 			} else {
 				notes.push(
-					`⚠ 强制（戏内）：用户在问剧情下一步怎么办或要把决定权交回。你的**第一个动作必须是 ask_director**，2~4 个场景内选项；工具返回前禁止写完整正文，禁止改成助手/导演旁白。`,
+					`⚠ 强制：用户在问剧情下一步怎么办或要把决定权交回。你的**第一个动作必须是 ask_director**，2~4 个场景内选项；工具返回前禁止写完整正文，禁止改成助手/导演旁白。`,
 				);
 			}
 		} else {
 			notes.push(
-				`决策门禁（戏内）：求方向、生成身份/人设、场景岔路、新重要角色/重大转折/设定定死 → ask_director；无岔路过场直接演。禁止正文手写选项。`,
+				`决策门禁：求方向、生成身份/人设、场景岔路、新重要角色/重大转折/设定定死 → ask_director；无岔路过场直接演。禁止正文手写选项。`,
 			);
 		}
 	}

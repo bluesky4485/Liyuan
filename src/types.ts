@@ -100,6 +100,11 @@ export interface RpConfig {
 	backendControl?: boolean;
 	/** 决策门禁档位（PLAN-PHASE4 柱 1）：ask=关键剧情决策点停笔询问用户；silent=不问，等同旧行为。默认 silent */
 	creationMode?: "ask" | "silent";
+	/**
+	 * 右栏「助手」的独立模型（2026-07-14 拆分决策）：缺省=跟随剧情模型。
+	 * 剧情尺度大时可在助手面板单独指定宽容系模型（拒答风险与剧情模型解耦）。
+	 */
+	assistantModel?: { provider: string; id: string };
 }
 
 export const DEFAULT_CONFIG: RpConfig = {

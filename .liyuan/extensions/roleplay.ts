@@ -55,7 +55,7 @@ import {
 import { enabledBlocks, normalizeRpPreset, type RpPreset } from "../../src/preset.ts";
 import { formatPruneStats, pruneClosedTurns } from "../../src/retention.ts";
 import { buildLoreAliasPrompt, buildScribeTurnPrompt, parseLoreAliases, parseScribeResult } from "../../src/scribe.ts";
-import { listSkills, saveSkill } from "../../src/skills.ts";
+import { listSkills } from "../../src/skills.ts";
 import { formatUploadIndex, listUploads } from "../../src/uploads.ts";
 import { isBackstageText } from "../../src/stance.ts";
 import {
@@ -101,8 +101,8 @@ import {
 
 // 剧情工具（world_state_update 于 F3 还给主演——场记已兜底，主演亲手记账更及时，PLAN-PHASE3 §6.3；
 // lorebook_write：新造设定固化为正典，写入补充设定集 .liyuan-lore/，用户原始世界书永远只读；
-// show_image / show_audio / show_video：媒体通道交付；skill_save：技能沉淀；
-// panel_*：agent 自建面板（PLAN-PHASE4 柱 2）——agent 持有的前端展示面）
+// show_image / show_audio / show_video：媒体通道交付；panel_*：agent 自建面板（PLAN-PHASE4 柱 2）。
+// skill_save 已迁往右栏「助手」（2026-07-14 拆分）：沉淀归助手，使用权（read 笔记照调）仍在剧情侧）
 const RP_TOOLS = [
 	"lorebook_search",
 	"world_state_get",
@@ -117,7 +117,6 @@ const RP_TOOLS = [
 	"show_video",
 	"show_html",
 	"tts",
-	"skill_save",
 	"panel_write",
 	"panel_read",
 	"panel_close",
@@ -978,36 +977,8 @@ export default function roleplayExtension(pi: ExtensionAPI) {
 			},
 		});
 
-		// 技能沉淀（PLAN-PHASE3 §6.4）：agent 摸通外部服务后自写调用笔记，跨会话复用
-		pi.registerTool({
-			name: "skill_save",
-			label: "沉淀技能",
-			description:
-				"Save a reusable skill note into the skill library (${DIRS.skills}/) — how to call an external service/API you just figured out, or one the user handed you (URL + key) and asked to save. Write it so a future session can succeed in ONE step: base URL, auth, request format, one VERIFIED curl example, quirks. Saving with an existing name updates that skill.",
-			parameters: Type.Object({
-				name: Type.String({ description: "Short stable skill name, e.g. 'comfyui-生图'" }),
-				description: Type.String({ description: "One-line summary shown in the skill index" }),
-				content: Type.String({ description: "Full note in Markdown: endpoint, auth, request format, verified curl example, notes" }),
-				disableModelInvocation: Type.Optional(
-					Type.Boolean({
-						description:
-							"true = hide this skill from the model-facing index; it can only be invoked explicitly by the user via /skill:name. Use when the user says the skill should only run on their explicit command.",
-					}),
-				),
-			}),
-			async execute(_id, params) {
-				const saved = saveSkill(appCwd, params);
-				return {
-					content: [
-						{
-							type: "text",
-							text: `技能已${saved.updated ? "更新" : "保存"}：${params.name}（${saved.file}）。本会话的技能清单不会刷新，但文件已生效——下次会话可直接按清单调用。`,
-						},
-					],
-					details: saved,
-				};
-			},
-		});
+		// 技能沉淀（skill_save）已迁至右栏「助手」（2026-07-14 拆分）：摸索与沉淀是工程活，
+		// 不再打断剧情模型；技能清单仍进剧情 system prompt（使用权保留，见 director 技能库节）。
 
 		// ---------- Agent 自建面板（PLAN-PHASE4 柱 2）：agent 持有的前端展示面 ----------
 		//
@@ -1228,7 +1199,6 @@ export default function roleplayExtension(pi: ExtensionAPI) {
 				constantLore: constantEntries(entries),
 				presetSystemBlocks: preset ? enabledBlocks(preset, "system") : undefined,
 				// Web 宿主注入自身接口地址（TUI 下缺省）；会话内不变，D8 字节稳定
-				selfApiBase: process.env.LIYUAN_HTTP || undefined,
 				// 技能库索引（§6.4）：session_start 装载，会话内字节稳定
 				skills: listSkills(ctx.cwd),
 				mcpIndex: mcpIndexCache,
@@ -1366,10 +1336,11 @@ export default function roleplayExtension(pi: ExtensionAPI) {
 			? detectsLanguageMismatch(extractText(lastNarrative), config.language)
 			: false;
 
-		// 姿态：仅显式场外标记 → 戏外；无标记一律戏内（模型不得自行改判）
+		// 本轮用户原文（求方向检测用）。场外标记消息已在 server 层改道助手会话，
+		// 正常不会出现在这里；旧会话续接时若最后一条恰是遗留戏外轮，不做求方向升格即可。
 		const lastUser = [...messages].reverse().find((m) => m.role === "user");
 		const lastUserText = lastUser ? extractText(lastUser) : "";
-		const stance: "onstage" | "backstage" = lastUserText && isBackstageText(lastUserText) ? "backstage" : "onstage";
+		const legacyBackstage = !!lastUserText && isBackstageText(lastUserText);
 
 		messages.push({
 			role: "custom",
@@ -1379,13 +1350,12 @@ export default function roleplayExtension(pi: ExtensionAPI) {
 				activatedLore: activated,
 				card,
 				config,
-				stance,
 				languageMismatch,
 				presetPostHistoryBlocks: preset ? enabledBlocks(preset, "postHistory") : undefined,
 				panelIndex: formatPanelIndex(panels) ?? undefined,
 				codexIndex: codexIndexCache ?? undefined,
 				uploadIndex: formatUploadIndex(listUploads(appCwd)) ?? undefined,
-				userText: stance === "onstage" ? lastUserText : undefined,
+				userText: legacyBackstage ? undefined : lastUserText,
 			}),
 			display: false,
 			timestamp: Date.now(),
@@ -2000,7 +1970,6 @@ export default function roleplayExtension(pi: ExtensionAPI) {
 						config,
 						constantLore: constantEntries(entries),
 						presetSystemBlocks: preset ? enabledBlocks(preset, "system") : undefined,
-						selfApiBase: process.env.LIYUAN_HTTP || undefined,
 						skills: listSkills(appCwd),
 						mcpIndex: mcpIndexCache,
 					});
@@ -2054,7 +2023,6 @@ export default function roleplayExtension(pi: ExtensionAPI) {
 			config,
 			constantLore: constantEntries(entries),
 			presetSystemBlocks: preset ? enabledBlocks(preset, "system") : undefined,
-			selfApiBase: process.env.LIYUAN_HTTP || undefined,
 			skills: listSkills(cwd),
 			mcpIndex: mcpIndexCache,
 		});

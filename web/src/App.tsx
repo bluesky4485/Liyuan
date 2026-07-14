@@ -26,6 +26,7 @@ import {
 	type AttachmentView,
 } from "./attachments.ts";
 import { ArtifactPanel } from "./components/ArtifactPanel.tsx";
+import { AssistantPanel } from "./components/AssistantPanel.tsx";
 import { BrandLogo } from "./components/BrandLogo.tsx";
 import { CardPanel } from "./components/CardPanel.tsx";
 import { CodexPanel } from "./components/CodexPanel.tsx";
@@ -35,6 +36,7 @@ import { PanelRefreshContext } from "./components/kit.tsx";
 import { setAtHome, shouldShowHomeOnBoot, touchVisit } from "./visit.ts";
 import {
 	IconApi,
+	IconAssistant,
 	IconAttach,
 	IconBell,
 	IconCard,
@@ -59,6 +61,7 @@ import {
 	BackstageGroup,
 	Bubble,
 	ChoiceCard,
+	LiveSteps,
 	MsgAvatar,
 	RichContent,
 	ThinkingBlock,
@@ -75,7 +78,16 @@ import { SessionStatsBar, StatusStrip } from "./components/StatusStrip.tsx";
 import { UploadsPanel } from "./components/UploadsPanel.tsx";
 import { StoreModal, WorldlinePanel } from "./components/WorldlinePanel.tsx";
 import { useWire, type ConnState } from "./ws.ts";
-import type { RpPanel, ServerFrame, WireActivity, WireSessionInfo, WireStats, WorldState } from "./wire.ts";
+import type {
+	AssistantModelInfo,
+	AssistantMsg,
+	RpPanel,
+	ServerFrame,
+	WireActivity,
+	WireSessionInfo,
+	WireStats,
+	WorldState,
+} from "./wire.ts";
 
 interface Toast {
 	id: number;
@@ -115,7 +127,8 @@ type PanelId =
 	| "lorebook"
 	| "codex"
 	| "persona"
-	| "uploads";
+	| "uploads"
+	| "assistant";
 
 /** agent 自建面板的右栏选择 id（柱 2）：`agent:` + 面板名，页签随 panels 帧动态长出 */
 type AgentPanelId = `agent:${string}`;
@@ -130,6 +143,8 @@ const agentId = (name: string): AgentPanelId => `agent:${name}`;
  */
 const LEFT_PANELS: PanelId[] = ["connect", "preset", "powers", "uploads"];
 const RIGHT_PANELS: PanelId[] = ["card", "lorebook", "codex", "persona"];
+/** 右栏可开面板全集：顶栏 4 入口 + 助手（入口在输入框发送钮右侧，不占顶栏） */
+const RIGHT_OPENABLE: PanelId[] = [...RIGHT_PANELS, "assistant"];
 
 /** 长文面板用宽档（横切基建 §1 面板宽度） */
 const WIDE_PANELS = new Set<PanelId>(["card", "lorebook", "codex"]);
@@ -146,6 +161,7 @@ const PANEL_LABEL: Record<PanelId, string> = {
 	codex: "知识库",
 	persona: "用户角色",
 	uploads: "上传区",
+	assistant: "助手",
 };
 
 /** 顶栏图标(收纳入口的关键:图标承载识别,文字进 tooltip/aria-label) */
@@ -161,6 +177,7 @@ const PANEL_ICON: Record<PanelId, (p: { size?: number }) => React.JSX.Element> =
 	codex: IconCodex,
 	persona: IconPersona,
 	uploads: IconUploads,
+	assistant: IconAssistant,
 };
 
 type CenterMenu = "settings" | "panels" | null;
@@ -174,7 +191,7 @@ function loadPanelPrefs(): { left: PanelId | null; right: PanelId | null } {
 		const pick = (v: unknown, group: PanelId[]) => (group.includes(v as PanelId) ? (v as PanelId) : null);
 		const left = pick(raw.left, LEFT_OPENABLE);
 		// settings 走中央下拉，旧 prefs 里的 settings 忽略
-		return { left: left === ("settings" as PanelId) ? null : left, right: pick(raw.right, RIGHT_PANELS) };
+		return { left: left === ("settings" as PanelId) ? null : left, right: pick(raw.right, RIGHT_OPENABLE) };
 	} catch {
 		return { left: null, right: null };
 	}
@@ -193,6 +210,8 @@ export default function App() {
 	const [thinkingLive, setThinkingLive] = useState(false);
 	const [busy, setBusy] = useState(false);
 	const [toolNote, setToolNote] = useState<string | null>(null);
+	/** 本轮过程步骤（实时清单渲染用；与 turnActsRef 同内容） */
+	const [liveActs, setLiveActs] = useState<WireActivity[]>([]);
 	const [toasts, setToasts] = useState<Toast[]>([]);
 	const [input, setInput] = useState("");
 	// 待发送附件（附件随消息，上传即落服务端 .liyuan-uploads/，发送时路径附在消息尾行）
@@ -213,6 +232,19 @@ export default function App() {
 	const [activeChoice, setActiveChoice] = useState<{ id: string; question: string; options: string[]; placeholder?: string } | null>(null);
 	// agent 自建面板（柱 2）：server 推送的活跃面板全量（页签序）；入口在面板坞，展开到左栏
 	const [agentPanels, setAgentPanels] = useState<RpPanel[]>([]);
+	// 助手（右栏独立会话，2026-07-14 拆分）：消息/流式/模型全由 assistant_* 帧驱动
+	const [asstMsgs, setAsstMsgs] = useState<AssistantMsg[] | null>(null);
+	const [asstBusy, setAsstBusy] = useState(false);
+	const [asstStreamText, setAsstStreamText] = useState("");
+	const [asstStreamThinking, setAsstStreamThinking] = useState("");
+	const [asstThinkingLive, setAsstThinkingLive] = useState(false);
+	const [asstToolNote, setAsstToolNote] = useState<string | null>(null);
+	/** 助手本轮过程步骤（实时清单渲染用；与 asstActsRef 同内容） */
+	const [asstLiveActs, setAsstLiveActs] = useState<WireActivity[]>([]);
+	const [asstModel, setAsstModel] = useState<AssistantModelInfo | null>(null);
+	const [asstFollow, setAsstFollow] = useState(true);
+	/** 面板关着时收到助手回复：发送钮旁的小圆点提示 */
+	const [asstUnread, setAsstUnread] = useState(false);
 	// 面板系统
 	const initialPanels = useMemo(loadPanelPrefs, []);
 	const [leftPanel, setLeftPanel] = useState<PanelId | AgentPanelId | null>(initialPanels.left);
@@ -303,6 +335,11 @@ export default function App() {
 	const streamThinkingRef = useRef("");
 	const turnActsRef = useRef<WireActivity[]>([]);
 	const sessionIdRef = useRef("");
+	// 助手流式缓冲与本轮工具活动（与剧情侧同构，各自独立）
+	const asstStreamRef = useRef("");
+	const asstStreamThinkingRef = useRef("");
+	const asstActsRef = useRef<WireActivity[]>([]);
+	const rightPanelRef = useRef<PanelId | null>(initialPanels.right);
 	// onFrame 闭包内读最新面板/左栏选择（useCallback 依赖冻结，走 ref 防陈旧）
 	const agentPanelsRef = useRef<RpPanel[]>([]);
 	const leftPanelRef = useRef<PanelId | AgentPanelId | null>(initialPanels.left);
@@ -340,6 +377,12 @@ export default function App() {
 	useEffect(() => {
 		leftPanelRef.current = leftPanel;
 	}, [leftPanel]);
+
+	useEffect(() => {
+		rightPanelRef.current = rightPanel;
+		// 打开助手面板即消掉未读点
+		if (rightPanel === "assistant") setAsstUnread(false);
+	}, [rightPanel]);
 
 	useEffect(() => {
 		welcomeRef.current = welcome;
@@ -387,6 +430,33 @@ export default function App() {
 		streamThinkingRef.current = "";
 		setStreamText("");
 		setStreamThinking("");
+	};
+
+	const clearAsstStream = () => {
+		asstStreamRef.current = "";
+		asstStreamThinkingRef.current = "";
+		setAsstStreamText("");
+		setAsstStreamThinking("");
+	};
+
+	/** 本轮过程步骤追加：ref 供定稿时附着到消息，state 供生成中的实时清单渲染（codex 式全程可见） */
+	const pushAct = (a: WireActivity) => {
+		turnActsRef.current = [...turnActsRef.current, a];
+		setLiveActs(turnActsRef.current);
+	};
+	const resetActs = () => {
+		turnActsRef.current = [];
+		setLiveActs([]);
+	};
+	/** 中间旁白留档：模型在调工具前吐出的计划文字被服务端从叙事流过滤时，客户端把它收进过程清单 */
+	const captureStreamNote = () => {
+		const t = streamRef.current.trim();
+		if (!t) return;
+		turnActsRef.current = [
+			...turnActsRef.current,
+			{ kind: "note", name: "", detail: t.length > 400 ? `${t.slice(0, 400)}…` : t },
+		];
+		setLiveActs(turnActsRef.current);
 	};
 
 	/**
@@ -491,11 +561,9 @@ export default function App() {
 					if (frame.message.channel === "narrative" || frame.message.channel === "backstage") {
 						clearStream();
 						setToolNote(null);
-						// 过程条 v0：把本轮积累的工具活动挂到定稿消息上（不持久化，刷新即失）
-						// 注意：同轮可能先有中间段再有定稿——活动只在「本条 message」挂载一次，
-						// upsert 会把多次 activities 拼进同一泡。
+						// 过程条：把本轮积累的步骤（工具+旁白）收进定稿消息的单个折叠（不持久化，刷新即失）
 						const acts = turnActsRef.current;
-						turnActsRef.current = [];
+						resetActs();
 						const incoming: ChatMsg = acts.length ? { ...frame.message, activities: acts } : frame.message;
 						setMessages((ms) => upsertTurnReply(ms, incoming));
 					} else if (frame.message.channel === "greeting") {
@@ -522,8 +590,9 @@ export default function App() {
 					}
 					break;
 				case "stream":
-					// 中间 tool 轮被 server 过滤：立刻丢掉计划旁白流式半成品
+					// 中间 tool 轮被 server 过滤：计划旁白留档进过程清单，再清流式半成品
 					if (frame.state === "clear") {
+						captureStreamNote();
 						clearStream();
 						setThinkingLive(false);
 					}
@@ -531,7 +600,7 @@ export default function App() {
 				case "agent":
 					if (frame.state === "start") {
 						setBusy(true);
-						turnActsRef.current = [];
+						resetActs();
 					} else {
 						setBusy(false);
 						setThinkingLive(false);
@@ -543,7 +612,7 @@ export default function App() {
 							const text = streamRef.current;
 							const thinking = streamThinkingRef.current.trim();
 							const acts = turnActsRef.current;
-							turnActsRef.current = [];
+							resetActs();
 							clearStream();
 							const leftover: ChatMsg = {
 								channel: "narrative",
@@ -554,15 +623,17 @@ export default function App() {
 							setMessages((ms) => upsertTurnReply(ms, leftover));
 						} else {
 							clearStream();
+							setLiveActs([]);
 						}
 					}
 					break;
 				case "activity":
-					// 工具开始时清掉流式计划旁白；生成中气泡壳靠 busy 保持，不再反复拆装成多个泡
+					// 工具开始时把已流出的计划旁白留档，再清流式；步骤实时追加进清单
 					if (frame.activity.kind === "tool_start" && (streamRef.current || streamThinkingRef.current)) {
+						captureStreamNote();
 						clearStream();
 					}
-					turnActsRef.current = [...turnActsRef.current, frame.activity];
+					pushAct(frame.activity);
 					setToolNote(frame.activity.kind === "tool_start" ? `${toolLabel(frame.activity.name)}…` : null);
 					break;
 				case "state":
@@ -608,6 +679,79 @@ export default function App() {
 				case "choice_resolved":
 					// 该询问已决（本端/他端应答或超时）：收起 live 卡；留痕由工具结果重放消息承载
 					setActiveChoice((c) => (c && c.id === frame.id ? null : c));
+					break;
+				case "assistant_hello":
+					setAsstMsgs(frame.messages);
+					setAsstBusy(frame.busy);
+					setAsstModel(frame.model);
+					setAsstFollow(frame.follow);
+					setAsstThinkingLive(false);
+					setAsstToolNote(null);
+					asstActsRef.current = [];
+					setAsstLiveActs([]);
+					clearAsstStream();
+					break;
+				case "assistant_message": {
+					const msg = frame.message;
+					if (msg.role === "assistant") {
+						clearAsstStream();
+						const acts = asstActsRef.current;
+						asstActsRef.current = [];
+						setAsstLiveActs([]);
+						const incoming: AssistantMsg = acts.length ? { ...msg, activities: acts } : msg;
+						setAsstMsgs((ms) => [...(ms ?? []), incoming]);
+						// 最终回复（非中间步骤）且面板没开着：点亮未读点
+						if (!msg.mid && rightPanelRef.current !== "assistant") setAsstUnread(true);
+					} else {
+						setAsstMsgs((ms) => [...(ms ?? []), msg]);
+					}
+					break;
+				}
+				case "assistant_delta":
+					if (frame.kind === "text") {
+						setAsstThinkingLive(false);
+						asstStreamRef.current += frame.delta;
+						setAsstStreamText(asstStreamRef.current);
+					} else {
+						setAsstThinkingLive(true);
+						asstStreamThinkingRef.current += frame.delta;
+						setAsstStreamThinking(asstStreamThinkingRef.current);
+					}
+					break;
+				case "assistant_state":
+					if (frame.state === "start") {
+						setAsstBusy(true);
+						asstActsRef.current = [];
+						setAsstLiveActs([]);
+					} else {
+						setAsstBusy(false);
+						setAsstThinkingLive(false);
+						setAsstToolNote(null);
+						// 中断遗留的半截回复：并入消息列表（不丢字）
+						if (asstStreamRef.current.trim()) {
+							const text = asstStreamRef.current;
+							const thinking = asstStreamThinkingRef.current.trim();
+							const acts = asstActsRef.current;
+							asstActsRef.current = [];
+							setAsstLiveActs([]);
+							clearAsstStream();
+							setAsstMsgs((ms) => [
+								...(ms ?? []),
+								{ role: "assistant", text, ...(thinking ? { thinking } : {}), ...(acts.length ? { activities: acts } : {}) },
+							]);
+						} else {
+							clearAsstStream();
+							setAsstLiveActs([]);
+						}
+					}
+					break;
+				case "assistant_activity":
+					if (frame.activity.kind === "tool_start" && (asstStreamRef.current || asstStreamThinkingRef.current)) {
+						clearAsstStream();
+					}
+					asstActsRef.current = [...asstActsRef.current, frame.activity];
+					setAsstLiveActs(asstActsRef.current);
+					setAsstToolNote(frame.activity.kind === "tool_start" ? `${toolLabel(frame.activity.name)}…` : null);
 					break;
 				case "notify":
 					pushToast(frame.level, frame.text);
@@ -756,7 +900,7 @@ export default function App() {
 	useEffect(() => {
 		const el = listRef.current;
 		if (el && atBottomRef.current) el.scrollTop = el.scrollHeight;
-	}, [messages, streamText, streamThinking, thinkingLive, toolNote]);
+	}, [messages, streamText, streamThinking, thinkingLive, toolNote, liveActs]);
 
 	const onScroll = () => {
 		const el = listRef.current;
@@ -772,6 +916,19 @@ export default function App() {
 		atBottomRef.current = true;
 		setAtBottom(true);
 		el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+	};
+
+	/**
+	 * 场外标记粗判（仅 UX 用：发出后顺手展开助手面板）。
+	 * 路由权威在 server（src/stance.ts isBackstageText）——此处判错顶多少开一次面板。
+	 */
+	const looksBackstage = (t: string): boolean => {
+		const s = t.trim();
+		if (!s) return false;
+		if (s.startsWith("//") || s.startsWith("((") || s.startsWith("（（")) return true;
+		const a = s[0];
+		const b = s[s.length - 1];
+		return (a === "(" || a === "（") && (b === ")" || b === "）");
 	};
 
 	const send = useCallback(() => {
@@ -799,13 +956,18 @@ export default function App() {
 			openLeft("worldline");
 		} else {
 			ws.send({ type: "prompt", text });
+			// 场外标记 → server 会改道助手会话：这边顺手展开右栏，让回复有地方落
+			if (looksBackstage(typed)) {
+				setAsstUnread(false);
+				openRight("assistant");
+			}
 		}
 		setInput("");
 		setPending([]);
 		atBottomRef.current = true;
 		setAtBottom(true);
 		if (inputRef.current) inputRef.current.style.height = "auto";
-	}, [input, pending, conn, ws, openStoreModal]);
+	}, [input, pending, conn, ws, openStoreModal, openRight]);
 
 	// 上传：即时落服务端 .liyuan-uploads/，成功后进 pending（chip 显示，发送时随消息）
 	const doUpload = useCallback(
@@ -1060,6 +1222,26 @@ export default function App() {
 							);
 							pushToast("info", `已附到待发送：${u.name}`);
 						}}
+					/>
+				);
+			case "assistant":
+				return (
+					<AssistantPanel
+						msgs={asstMsgs}
+						busy={asstBusy}
+						streamText={asstStreamText}
+						streamThinking={asstStreamThinking}
+						thinkingLive={asstThinkingLive}
+						toolNote={asstToolNote}
+						liveActs={asstLiveActs}
+						model={asstModel}
+						follow={asstFollow}
+						onSend={(text) => ws.send({ type: "assistant_prompt", text })}
+						onAbort={() => ws.send({ type: "assistant_abort" })}
+						onNew={() => ws.send({ type: "assistant_new" })}
+						onPickModel={(sel) =>
+							ws.send(sel ? { type: "assistant_model", provider: sel.provider, id: sel.id } : { type: "assistant_model" })
+						}
 					/>
 				);
 		}
@@ -1532,14 +1714,15 @@ export default function App() {
 									)}
 								</>
 							)}
-							{/* 整轮生成共用一个实时角色泡：中间 tool 轮不拆成多个气泡；定稿后若无新流式则收起壳 */}
-							{busy && (!turnHasCommittedReply || streamText || streamThinking || toolNote) && (
+							{/* 整轮生成共用一个实时角色泡：过程步骤实时追加平铺（codex 式），定稿后随消息收进单个折叠 */}
+							{busy && (!turnHasCommittedReply || streamText || streamThinking || toolNote || liveActs.length > 0) && (
 								<div className="msg msg-char msg-live">
 									<div className="msg-head">
 										<MsgAvatar src={charAvatarUrl} name={charName} kind="char" />
 										<span className="msg-name msg-name-char">{charName}</span>
 										<span className="msg-live-tag">生成中</span>
 									</div>
+									{liveActs.length > 0 && <LiveSteps activities={liveActs} />}
 									{streamThinking && <ThinkingBlock text={streamThinking} live={thinkingLive} />}
 									{streamText && <RichContent text={streamText} />}
 									{toolNote && (
@@ -1737,6 +1920,25 @@ export default function App() {
 									<IconSend size={17} />
 								</button>
 							)}
+							{/* 助手入口（2026-07-14 拆分）：发送箭头右侧，点开右栏助手对话 */}
+							<button
+								type="button"
+								className={`dock-btn asst-btn ${rightPanel === "assistant" ? "active" : ""}`}
+								onClick={() => {
+									if (rightPanel === "assistant") {
+										openRight(null);
+										return;
+									}
+									setAsstUnread(false);
+									openRight("assistant");
+									ws.send({ type: "assistant_sync" });
+								}}
+								title="助手"
+								aria-label="打开助手面板"
+							>
+								<IconAssistant size={18} />
+								{asstUnread && <span className="asst-dot" aria-hidden="true" />}
+							</button>
 						</div>
 						{/* 会话用量：输入框下方，右缘与输入框齐平 */}
 						<div className="composer-shell session-stats-wrap">

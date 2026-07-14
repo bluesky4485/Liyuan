@@ -118,14 +118,43 @@ export interface WireStats {
 	contextWindow?: number | null;
 }
 
-/** 过程活动（过程条 v0：工具调用；F3 扩展场记/审计） */
+/** 过程活动（过程条：工具调用 + 客户端留档的中间旁白） */
 export interface WireActivity {
-	kind: "tool_start" | "tool_end";
+	/**
+	 * tool_start / tool_end 由 server 事件产生；
+	 * note = 前端捕获的中间旁白（模型在调工具前流式吐出的计划文字，
+	 * 服务端把该中间轮从叙事流过滤时，客户端将其留档进过程清单——server 永不发送此类）。
+	 */
+	kind: "tool_start" | "tool_end" | "note";
 	name: string;
-	/** start=参数摘要；end=结果摘要（截断） */
+	/** start=参数摘要；end=结果摘要（截断）；note=旁白正文（截断） */
 	detail?: string;
 	/** tool_end 专用：是否出错 */
 	isError?: boolean;
+}
+
+/**
+ * 右栏「助手」消息（独立会话，2026-07-14 职责拆分）。
+ * 与剧情 WireMsg 分开：助手没有叙事通道语义，只有对话与过程。
+ */
+export interface AssistantMsg {
+	role: "user" | "assistant";
+	text: string;
+	/** 模型思维链（折叠展示） */
+	thinking?: string;
+	/** 中间步骤（带工具调用的计划旁白）：面板折进「过程」，只露最终回复 */
+	mid?: boolean;
+	/** 本条消息期间的工具活动（live 时由前端积累；历史重放不带） */
+	activities?: WireActivity[];
+	/** 助手交付的媒体（show_media 工具）：在助手对话里内联展示，不进剧情流 */
+	media?: { src: string; kind: "image" | "audio" | "video"; caption?: string };
+}
+
+/** 助手当前模型信息（模型选择器数据） */
+export interface AssistantModelInfo {
+	provider: string;
+	id: string;
+	name: string;
 }
 
 /** Server → Client 帧 */
@@ -158,6 +187,20 @@ export type ServerFrame =
 	| { type: "choice"; id: string; question: string; options: string[]; placeholder?: string }
 	/** 询问已决（本端应答成功 / 他端先答 / 超时/中止）：前端把未决卡收敛成留痕态 */
 	| { type: "choice_resolved"; id: string; answer?: string; stopped?: boolean }
+	/** 助手（右栏独立会话）：全量对齐（连接、面板打开、新对话、换模型后） */
+	| {
+			type: "assistant_hello";
+			messages: AssistantMsg[];
+			busy: boolean;
+			/** 当前助手模型（null=尚无可用模型） */
+			model: AssistantModelInfo | null;
+			/** true=未单独指定，跟随剧情模型 */
+			follow: boolean;
+	  }
+	| { type: "assistant_message"; message: AssistantMsg }
+	| { type: "assistant_delta"; kind: "text" | "thinking"; delta: string }
+	| { type: "assistant_state"; state: "start" | "end" }
+	| { type: "assistant_activity"; activity: WireActivity }
 	| { type: "error"; text: string };
 
 /** Client → Server 帧 */
@@ -181,6 +224,12 @@ export type ClientFrame =
 	| { type: "open"; path: string }
 	/** 剧情决策应答：value=选项原文或自由输入；stop=停止本回合（笔还给用户） */
 	| { type: "choice_reply"; id: string; value?: string; stop?: boolean }
+	/** 助手（右栏独立会话）：发话 / 停止 / 新对话 / 请求全量 / 选模型（provider+id 均缺省 = 跟随剧情模型） */
+	| { type: "assistant_prompt"; text: string }
+	| { type: "assistant_abort" }
+	| { type: "assistant_new" }
+	| { type: "assistant_sync" }
+	| { type: "assistant_model"; provider?: string; id?: string }
 	| { type: "new" };
 
 /** 翻译时需要的显示名 */
@@ -454,6 +503,56 @@ export function toWireHistory(messages: unknown[], names: WireNames): WireMsg[] 
 		if (w) out.push(w);
 	}
 	return foldTurnNarratives(out);
+}
+
+/**
+ * 助手会话历史 → AssistantMsg 列表（assistant_hello 用）。
+ * 只保留 user / assistant 对话面 + show_media 的媒体交付；注入 custom、空轮丢弃；
+ * 带 toolCall 的中间轮标 mid（面板折进「过程」）。
+ */
+export function toAssistantHistory(messages: unknown[]): AssistantMsg[] {
+	const out: AssistantMsg[] = [];
+	for (const m of messages) {
+		if (!m || typeof m !== "object") continue;
+		const msg = m as MsgLike;
+		const text = textOf(msg.content).trim();
+		if (msg.role === "user") {
+			if (text) out.push({ role: "user", text });
+			continue;
+		}
+		if (msg.role === "assistant") {
+			const thinking = thinkingOf(msg.content).trim();
+			if (!text && !thinking) continue;
+			out.push({
+				role: "assistant",
+				text: text || "（本轮只有思考与工具调用）",
+				...(thinking ? { thinking } : {}),
+				...(hasToolCall(msg.content) ? { mid: true } : {}),
+			});
+			continue;
+		}
+		if (msg.role === "toolResult") {
+			const media = assistantMediaOfToolResult(msg);
+			if (media) out.push(media);
+		}
+	}
+	return out;
+}
+
+/** show_media 工具结果 → 助手媒体消息；非该工具或结构不符返回 null */
+export function assistantMediaOfToolResult(msg: MsgLike): AssistantMsg | null {
+	if (msg.toolName !== "show_media" || msg.isError === true) return null;
+	const md =
+		msg.details && typeof msg.details === "object"
+			? (msg.details as { asstMedia?: { src?: unknown; kind?: unknown; caption?: unknown } }).asstMedia
+			: undefined;
+	if (!md || typeof md.src !== "string") return null;
+	const kind = md.kind === "audio" || md.kind === "video" ? md.kind : "image";
+	return {
+		role: "assistant",
+		text: typeof md.caption === "string" ? md.caption : "",
+		media: { src: md.src, kind, ...(typeof md.caption === "string" ? { caption: md.caption } : {}) },
+	};
 }
 
 /**

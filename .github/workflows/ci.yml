@@ -69,9 +69,16 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
           cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            web/package-lock.json
 
       - name: Install root
         run: npm install
+
+      # web/ 是独立 package（deps 不在根 lock 里）；不装则 vite build 找不到 @vitejs/plugin-react
+      - name: Install frontend deps
+        run: npm --prefix web ci
 
       - name: Build frontend
         run: npm run web:build

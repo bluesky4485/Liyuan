@@ -102,6 +102,8 @@ export interface WireSessionInfo {
 	preview?: string;
 	/** 会话所属卡名（rp-card 条目；与当前卡绑定） */
 	cardName?: string;
+	/** 会话绑定的角色卡路径（rp-card.data.card；用于前端兜底过滤） */
+	card?: string;
 }
 
 /** 会话统计（getSessionStats 裁剪投影） */
@@ -196,12 +198,30 @@ export type ServerFrame =
 			model: AssistantModelInfo | null;
 			/** true=未单独指定，跟随剧情模型 */
 			follow: boolean;
+			/** 当前助手会话路径（便于历史列表高亮） */
+			sessionPath?: string;
 	  }
+	/** 助手历史列表（已按当前角色卡过滤） */
+	| { type: "assistant_sessions"; list: AssistantSessionInfo[] }
 	| { type: "assistant_message"; message: AssistantMsg }
 	| { type: "assistant_delta"; kind: "text" | "thinking"; delta: string }
 	| { type: "assistant_state"; state: "start" | "end" }
 	| { type: "assistant_activity"; activity: WireActivity }
 	| { type: "error"; text: string };
+
+/** 助手会话列表条目（绑定角色卡，与剧情会话列表同构裁剪） */
+export interface AssistantSessionInfo {
+	path: string;
+	id: string;
+	name?: string;
+	firstMessage: string;
+	modified: number;
+	messageCount: number;
+	current: boolean;
+	preview?: string;
+	cardName?: string;
+	card?: string;
+}
 
 /** Client → Server 帧 */
 export type ClientFrame =
@@ -230,6 +250,10 @@ export type ClientFrame =
 	| { type: "assistant_new" }
 	| { type: "assistant_sync" }
 	| { type: "assistant_model"; provider?: string; id?: string }
+	/** 助手历史：拉列表 / 打开 / 删除（均按当前角色卡过滤） */
+	| { type: "assistant_sessions" }
+	| { type: "assistant_open"; path: string }
+	| { type: "assistant_delete"; path: string }
 	| { type: "new" };
 
 /** 翻译时需要的显示名 */
@@ -560,14 +584,26 @@ export function assistantMediaOfToolResult(msg: MsgLike): AssistantMsg | null {
  * 取**最后一条**（换卡后会补写新标记；旧标记可能仍留在文件前部）。
  * 读前若干 KB 通常够；大会话若标记在尾部由调用方扩大窗口。
  */
-export function parseCardFromSessionHead(headText: string): { card: string; name: string } | null {
-	let found: { card: string; name: string } | null = null;
+export function parseCardFromSessionHead(
+	headText: string,
+): { card: string; name: string; storyId?: string } | null {
+	let found: { card: string; name: string; storyId?: string } | null = null;
 	for (const line of headText.split(/\r?\n/)) {
 		if (!line.includes('"rp-card"')) continue; // 快速跳过
 		try {
-			const e = JSON.parse(line) as { type?: unknown; customType?: unknown; data?: { card?: unknown; name?: unknown } };
+			const e = JSON.parse(line) as {
+				type?: unknown;
+				customType?: unknown;
+				data?: { card?: unknown; name?: unknown; storyId?: unknown };
+			};
 			if (e.type === "custom" && e.customType === "rp-card" && e.data && typeof e.data.card === "string") {
-				found = { card: e.data.card, name: typeof e.data.name === "string" ? e.data.name : "" };
+				found = {
+					card: e.data.card,
+					name: typeof e.data.name === "string" ? e.data.name : "",
+					...(typeof e.data.storyId === "string" && e.data.storyId.trim()
+						? { storyId: e.data.storyId.trim() }
+						: {}),
+				};
 			}
 		} catch {
 			// 半行/损坏行跳过

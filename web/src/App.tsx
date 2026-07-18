@@ -243,6 +243,8 @@ export default function App() {
 	const [asstLiveActs, setAsstLiveActs] = useState<WireActivity[]>([]);
 	const [asstModel, setAsstModel] = useState<AssistantModelInfo | null>(null);
 	const [asstFollow, setAsstFollow] = useState(true);
+	/** 助手历史（按当前角色卡过滤） */
+	const [asstSessions, setAsstSessions] = useState<import("./wire.ts").AssistantSessionInfo[] | null>(null);
 	/** 面板关着时收到助手回复：发送钮旁的小圆点提示 */
 	const [asstUnread, setAsstUnread] = useState(false);
 	// 面板系统
@@ -335,10 +337,13 @@ export default function App() {
 	const streamThinkingRef = useRef("");
 	const turnActsRef = useRef<WireActivity[]>([]);
 	const sessionIdRef = useRef("");
+	/** 用户已按停止：忽略迟到 delta，避免 UI 解锁后还在刷字 */
+	const abortingRef = useRef(false);
 	// 助手流式缓冲与本轮工具活动（与剧情侧同构，各自独立）
 	const asstStreamRef = useRef("");
 	const asstStreamThinkingRef = useRef("");
 	const asstActsRef = useRef<WireActivity[]>([]);
+	const asstAbortingRef = useRef(false);
 	const rightPanelRef = useRef<PanelId | null>(initialPanels.right);
 	// onFrame 闭包内读最新面板/左栏选择（useCallback 依赖冻结，走 ref 防陈旧）
 	const agentPanelsRef = useRef<RpPanel[]>([]);
@@ -579,6 +584,7 @@ export default function App() {
 					}
 					break;
 				case "delta":
+					if (abortingRef.current) break;
 					if (frame.kind === "text") {
 						setThinkingLive(false);
 						streamRef.current += frame.delta;
@@ -599,9 +605,11 @@ export default function App() {
 					break;
 				case "agent":
 					if (frame.state === "start") {
+						abortingRef.current = false;
 						setBusy(true);
 						resetActs();
 					} else {
+						abortingRef.current = false;
 						setBusy(false);
 						setThinkingLive(false);
 						setToolNote(null);
@@ -690,6 +698,11 @@ export default function App() {
 					asstActsRef.current = [];
 					setAsstLiveActs([]);
 					clearAsstStream();
+					// 换会话后重拉助手历史列表
+					sendRef.current({ type: "assistant_sessions" });
+					break;
+				case "assistant_sessions":
+					setAsstSessions(frame.list);
 					break;
 				case "assistant_message": {
 					const msg = frame.message;
@@ -708,6 +721,7 @@ export default function App() {
 					break;
 				}
 				case "assistant_delta":
+					if (asstAbortingRef.current) break;
 					if (frame.kind === "text") {
 						setAsstThinkingLive(false);
 						asstStreamRef.current += frame.delta;
@@ -720,10 +734,12 @@ export default function App() {
 					break;
 				case "assistant_state":
 					if (frame.state === "start") {
+						asstAbortingRef.current = false;
 						setAsstBusy(true);
 						asstActsRef.current = [];
 						setAsstLiveActs([]);
 					} else {
+						asstAbortingRef.current = false;
 						setAsstBusy(false);
 						setAsstThinkingLive(false);
 						setAsstToolNote(null);
@@ -1236,9 +1252,39 @@ export default function App() {
 						liveActs={asstLiveActs}
 						model={asstModel}
 						follow={asstFollow}
+						sessions={asstSessions}
 						onSend={(text) => ws.send({ type: "assistant_prompt", text })}
-						onAbort={() => ws.send({ type: "assistant_abort" })}
+						onAbort={() => {
+							// 强制停止：本地立刻解锁助手输入并冻结流式
+							asstAbortingRef.current = true;
+							setAsstBusy(false);
+							setAsstThinkingLive(false);
+							setAsstToolNote(null);
+							if (asstStreamRef.current.trim()) {
+								const text = asstStreamRef.current;
+								const thinking = asstStreamThinkingRef.current.trim();
+								const acts = asstActsRef.current;
+								asstActsRef.current = [];
+								setAsstLiveActs([]);
+								clearAsstStream();
+								setAsstMsgs((ms) => [
+									...(ms ?? []),
+									{
+										role: "assistant" as const,
+										text,
+										...(thinking ? { thinking } : {}),
+										...(acts.length ? { activities: acts } : {}),
+									},
+								]);
+							} else {
+								clearAsstStream();
+							}
+							ws.send({ type: "assistant_abort" });
+						}}
 						onNew={() => ws.send({ type: "assistant_new" })}
+						onRefreshSessions={() => ws.send({ type: "assistant_sessions" })}
+						onOpenSession={(path) => ws.send({ type: "assistant_open", path })}
+						onDeleteSession={(path) => ws.send({ type: "assistant_delete", path })}
 						onPickModel={(sel) =>
 							ws.send(sel ? { type: "assistant_model", provider: sel.provider, id: sel.id } : { type: "assistant_model" })
 						}
@@ -1325,7 +1371,19 @@ export default function App() {
 							style={visible ? { flex: "1 1 auto", minHeight: 0, display: "flex", flexDirection: "column", overflow: "hidden" } : { display: "none" }}
 						>
 							{ag ? (
-								<ArtifactPanel panel={ag} />
+								<ArtifactPanel
+									panel={ag}
+									onSaved={(p) => {
+										// 乐观更新；随后 WS panels 帧会再对齐
+										setAgentPanels((list) =>
+											list.map((x) =>
+												x.name === p.name
+													? { ...x, kind: p.kind as typeof x.kind, content: p.content, updatedAt: p.updatedAt }
+													: x,
+											),
+										);
+									}}
+								/>
 							) : (
 								<Fragment key={bodyKey}>{renderPanel(pid as PanelId)}</Fragment>
 							)}
@@ -1906,7 +1964,35 @@ export default function App() {
 								}}
 							/>
 							{busy ? (
-								<button className="btn btn-stop" onClick={() => ws.send({ type: "abort" })} title="停止" aria-label="停止生成">
+								<button
+									className="btn btn-stop"
+									onClick={() => {
+										// 强制停止：本地立刻解锁输入，冻结流式，不等待服务端确认
+										abortingRef.current = true;
+										setBusy(false);
+										setThinkingLive(false);
+										setToolNote(null);
+										if (streamRef.current.trim() || streamThinkingRef.current.trim()) {
+											const text = streamRef.current;
+											const thinking = streamThinkingRef.current.trim();
+											const acts = turnActsRef.current;
+											resetActs();
+											clearStream();
+											if (text.trim()) {
+												const leftover: ChatMsg = {
+													channel: "narrative",
+													text,
+													...(thinking ? { thinking } : {}),
+													...(acts.length ? { activities: acts } : {}),
+												};
+												setMessages((ms) => upsertTurnReply(ms, leftover));
+											}
+										}
+										ws.send({ type: "abort" });
+									}}
+									title="停止"
+									aria-label="停止生成"
+								>
 									<IconStop size={18} />
 								</button>
 							) : (
@@ -1932,6 +2018,7 @@ export default function App() {
 									setAsstUnread(false);
 									openRight("assistant");
 									ws.send({ type: "assistant_sync" });
+									ws.send({ type: "assistant_sessions" });
 								}}
 								title="助手"
 								aria-label="打开助手面板"

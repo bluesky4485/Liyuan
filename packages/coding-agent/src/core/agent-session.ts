@@ -1444,11 +1444,21 @@ export class AgentSession {
 
 	/**
 	 * Abort current operation and wait for agent to become idle.
+	 * Also cancels compaction/bash side-runs. Caps wait so a hung provider stream
+	 * cannot leave Stop blocked forever (UI must always be able to force-stop).
 	 */
 	async abort(): Promise<void> {
 		this.abortRetry();
+		this.abortCompaction();
+		this.abortBranchSummary();
+		this.abortBash();
 		this.agent.abort();
-		await this.agent.waitForIdle();
+		const idle = this.agent.waitForIdle();
+		const timeoutMs = 8_000;
+		await Promise.race([
+			idle,
+			new Promise<void>((resolve) => setTimeout(resolve, timeoutMs)),
+		]);
 	}
 
 	// =========================================================================

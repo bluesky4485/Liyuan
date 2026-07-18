@@ -8,7 +8,7 @@
 
 import { copyFileSync, existsSync, mkdirSync, readdirSync, renameSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, relative } from "node:path";
+import { dirname, isAbsolute, join, normalize, relative } from "node:path";
 
 /** 项目配置主文件（新） */
 export const CONFIG_FILE = "liyuan.config.json";
@@ -18,6 +18,25 @@ export const CONFIG_FILE_LEGACY = "rp.config.json";
 /** 预设默认文件名 */
 export const PRESET_FILE = "liyuan-preset.json";
 export const PRESET_FILE_LEGACY = "rp-preset.json";
+
+/**
+ * 角色卡路径是否同一张卡（会话列表过滤用）。
+ * 兼容相对/绝对、Windows 反斜杠、./ 前缀、盘符大小写。
+ */
+export function sameCardPath(a: string | undefined, b: string | undefined, projectCwd: string): boolean {
+	if (!a || !b) return false;
+	if (a === b) return true;
+	const key = (p: string) => {
+		const s = p.replace(/\\/g, "/").trim().replace(/^\.\//, "");
+		const abs = isAbsolute(s) ? s : join(projectCwd, s);
+		return normalize(abs).replace(/\\/g, "/").toLowerCase();
+	};
+	try {
+		return key(a) === key(b);
+	} catch {
+		return a.replace(/\\/g, "/").toLowerCase() === b.replace(/\\/g, "/").toLowerCase();
+	}
+}
 
 /** 数据目录（相对项目根） */
 export const DIRS = {

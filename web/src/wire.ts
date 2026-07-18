@@ -2,6 +2,7 @@
 export type {
 	AssistantModelInfo,
 	AssistantMsg,
+	AssistantSessionInfo,
 	ClientFrame,
 	RpPanel,
 	ServerFrame,

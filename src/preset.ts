@@ -25,7 +25,10 @@ export interface PresetBlock {
 
 export interface RpPreset {
 	name: string;
-	/** 采样参数（原样搬运，键与 OpenAI 兼容体一致） */
+	/**
+	 * 采样参数（ST 预设原样搬运，键与 OpenAI 兼容体一致）。
+	 * 文件/UI 里常驻全套；真正发请求时由 `projectSamplers` 按渠道投影（见 src/samplers.ts）。
+	 */
 	samplers: Record<string, number>;
 	blocks: PresetBlock[];
 }

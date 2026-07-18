@@ -310,7 +310,42 @@ async function streamAssistantResponse(
 	let partialMessage: AssistantMessage | null = null;
 	let addedPartial = false;
 
+	// If the provider stream ignores abort, still exit the consumer loop promptly.
 	for await (const event of response) {
+		if (signal?.aborted) {
+			const abortedMessage: AssistantMessage = partialMessage
+				? {
+						...partialMessage,
+						stopReason: "aborted",
+						errorMessage: partialMessage.errorMessage || "Request was aborted",
+					}
+				: {
+						role: "assistant",
+						content: [],
+						api: config.model.api,
+						provider: config.model.provider,
+						model: config.model.id,
+						usage: {
+							input: 0,
+							output: 0,
+							cacheRead: 0,
+							cacheWrite: 0,
+							totalTokens: 0,
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+						},
+						stopReason: "aborted",
+						errorMessage: "Request was aborted",
+						timestamp: Date.now(),
+					};
+			if (addedPartial) {
+				context.messages[context.messages.length - 1] = abortedMessage;
+			} else {
+				context.messages.push(abortedMessage);
+				await emit({ type: "message_start", message: { ...abortedMessage } });
+			}
+			await emit({ type: "message_end", message: abortedMessage });
+			return abortedMessage;
+		}
 		switch (event.type) {
 			case "start":
 				partialMessage = event.partial;

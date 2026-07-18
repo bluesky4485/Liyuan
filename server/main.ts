@@ -100,8 +100,10 @@ import {
 	type WireNames,
 	type WireStats,
 } from "./wire.ts";
-import { stripBackstageMarker } from "../src/stance.ts";
 import { createAssistantHost, type AssistantHost, type StoryBridge } from "./assistant.ts";
+import { registerAssistantRunner } from "../src/assistant-gateway.ts";
+import { sameCardPath } from "../src/paths.ts";
+import { syncStoryPanelsFromDisk, syncStoryStateFromDisk } from "../src/story-sync.ts";
 
 const cwd = process.cwd();
 const HOST = process.env.HOST ?? "0.0.0.0";
@@ -909,15 +911,31 @@ const restHost: RestHost = {
 	},
 	async switchToCard() {
 		refreshNamesFromConfig(); // rest.ts 已写盘新 card，先让会话过滤对准新卡
+		// 清卡缓存：换卡后列表必须按新 cardPath 重读 rp-card
+		cardCache.clear();
 		const frame = await listSessions();
-		const list = (frame as { type: "sessions"; list: Array<{ path: string; current: boolean }> }).list;
-		const target = list.find((s) => !s.current);
+		const list = (frame as { type: "sessions"; list: Array<{ path: string; current: boolean; card?: string }> }).list;
+		// 只在本卡会话里挑「最近非当前」；没有则新建（不把其它卡的 current 误当目标）
+		const target = list.find((s) => !s.current && (!s.card || sameCardPath(s.card, cardPath, cwd)));
+		let result: "switched" | "created";
 		if (target) {
 			await runtime.switchSession(target.path);
-			return "switched";
+			result = "switched";
+		} else {
+			await runtime.newSession();
+			result = "created";
 		}
-		await runtime.newSession();
-		return "created";
+		broadcast(await listSessions());
+		// 助手：换卡后按新剧情会话对齐（新建绑定，不误接旧卡/旧聊助手上下文）
+		if (assistantHost) {
+			try {
+				await assistantHost.switchToStory(session.sessionId);
+				broadcast(assistantHelloFrame());
+			} catch (err) {
+				console.error(`[liyuan] 换卡同步助手会话失败：${err instanceof Error ? err.message : String(err)}`);
+			}
+		}
+		return result;
 	},
 	promptCommand: (text) => handlePrompt(text),
 	queueCommand(text) {
@@ -928,9 +946,8 @@ const restHost: RestHost = {
 		});
 		return queued;
 	},
-	// 面板导入（柱 2 社区格式）：领域层校验逐条写入当前会话的面板文件（fs.watch 自动推送前端），
-	// 再经命令桥 /panelsync 让扩展收编进内存 + 会话树快照
-	importPanels(list) {
+	// 面板导入：写盘 + 进程内直达收编（不经 /panelsync prompt，避免 assistant_run 内死锁）
+	async importPanels(list) {
 		const file = join(artifactsDir, `${session.sessionId}.json`);
 		let panels = loadPanels(file);
 		let imported = 0;
@@ -953,22 +970,35 @@ const restHost: RestHost = {
 		}
 		if (imported > 0) {
 			savePanels(file, panels);
-			void handlePrompt("/panelsync").catch((err) => {
-				broadcast({ type: "error", text: err instanceof Error ? err.message : String(err) });
-			});
+			syncStoryPanelsFromDisk();
 		}
 		return { imported, names, errors };
 	},
-	// 用户删除面板：同 agent panel_close（归档出活跃列表）+ panelsync 收编
-	closePanel(name) {
+	// 用户删除面板：写盘 + 进程内收编
+	async closePanel(name) {
 		const file = join(artifactsDir, `${session.sessionId}.json`);
 		const panels = loadPanels(file);
 		const r = closePanelInMap(panels, name);
 		if (!r.ok) throw new Error(r.error);
 		savePanels(file, r.panels);
-		void handlePrompt("/panelsync").catch((err) => {
-			broadcast({ type: "error", text: err instanceof Error ? err.message : String(err) });
-		});
+		syncStoryPanelsFromDisk();
+	},
+	// 用户手改面板源码：同 import 写路径，但要求面板已存在且未归档
+	async savePanel(input) {
+		const name = String(input?.name ?? "").trim();
+		if (!name) throw new Error("面板名不能为空");
+		const file = join(artifactsDir, `${session.sessionId}.json`);
+		const panels = loadPanels(file);
+		const prev = panels[name];
+		if (!prev) throw new Error(`没有名为「${name}」的面板`);
+		if (prev.archived) throw new Error(`面板「${name}」已归档，请先由 agent 同名写入重开`);
+		const kind = typeof input.kind === "string" && input.kind.trim() ? input.kind.trim() : prev.kind;
+		const r = writePanel(panels, { name, kind, content: String(input.content ?? "") });
+		if (!r.ok) throw new Error(r.error);
+		savePanels(file, r.panels);
+		syncStoryPanelsFromDisk();
+		const saved = r.panels[name];
+		return { name: saved.name, kind: saved.kind, updatedAt: saved.updatedAt };
 	},
 	// 挂载知识库：与扩展 restoreCodexFromBranch 同规则——当前分支上最近的 rp-codex 快照
 	mountedCodexes() {
@@ -991,14 +1021,11 @@ const restHost: RestHost = {
 		return [];
 	},
 	// ---- 世界状态编辑（PLAN-PANELS §2.11）：用户主权 applyPatch，落盘即广播，命令桥收编进树 ----
-	applyStatePatch(patch) {
+	async applyStatePatch(patch) {
 		const file = join(stateDir, `${session.sessionId}.json`);
 		const r = applyPatch(loadState(file), patch);
 		saveState(file, r.state); // fs.watch 自动广播 state 帧
-		// statesync：扩展把磁盘状态收编进内存并快照进会话树（panelsync 同款命令桥）
-		void handlePrompt("/statesync").catch((err) => {
-			broadcast({ type: "error", text: err instanceof Error ? err.message : String(err) });
-		});
+		syncStoryStateFromDisk();
 		return { applied: r.applied, warnings: r.warnings };
 	},
 	// ---- 世界线视图 / 软删除 / 线名 ----
@@ -1084,7 +1111,7 @@ const restHost: RestHost = {
 			if (isSameSessionPath(s.path, session.sessionFile)) continue;
 			const mtime = s.modified instanceof Date ? s.modified.getTime() : Number(s.modified) || 0;
 			const info = readSessionCard(s.path, mtime);
-			if (!info || info.card !== cardRel) continue;
+			if (!info || !sameCardPath(info.card, cardRel, cwd)) continue;
 			try {
 				unlinkSync(s.path);
 				cardCache.delete(s.path);
@@ -1268,6 +1295,18 @@ const storyBridge: StoryBridge = {
 			return { ok: false as const, error: err instanceof Error ? err.message : String(err) };
 		}
 	},
+	/** 委托模式：媒体同步进中间剧情流（与 show_image 同源 wire 通道） */
+	emitStoryMedia: (media) => {
+		const channel = media.kind === "audio" ? "audio" : media.kind === "video" ? "video" : "image";
+		broadcast({
+			type: "message",
+			message: {
+				channel,
+				text: media.caption ?? "",
+				src: media.src,
+			},
+		});
+	},
 	refreshStoryMaterials: () => restHost.softRefreshConfig(),
 	mountCodex: (name, on) => {
 		restHost.queueCommand(`/codexmount ${on ? "mount" : "unmount"} ${name}`);
@@ -1282,6 +1321,7 @@ const assistantHelloFrame = (): ServerFrame => ({
 	busy: assistantHost?.isStreaming() ?? false,
 	model: assistantHost?.modelInfo() ?? null,
 	follow: assistantHost?.follows() ?? true,
+	...(assistantHost?.sessionPath() ? { sessionPath: assistantHost.sessionPath() } : {}),
 });
 
 /** 助手会话事件 → assistant_* wire 帧（与剧情订阅同构，无 swipe/面板等剧情专属面） */
@@ -1375,8 +1415,72 @@ try {
 		onEvent: onAssistantEvent,
 		onError: (text) => broadcast({ type: "error", text }),
 	});
+	// 剧情侧 assistant_run → 本 Host（过程进右栏，结果可双写剧情流）
+	registerAssistantRunner(async (req) => {
+		if (!assistantHost) {
+			return {
+				ok: false,
+				summary: "助手不可用。",
+				media: [],
+				panelsWritten: [],
+				error: "no_host",
+			};
+		}
+		const task = req.task.trim();
+		if (!task) {
+			return { ok: false, summary: "任务为空。", media: [], panelsWritten: [], error: "empty" };
+		}
+		const modeHint =
+			req.mode && req.mode !== "auto"
+				? `【任务类型：${req.mode === "ops" ? "系统/API/办事" : req.mode === "author" ? "作者维护（面板/设定/账本）" : "诊断调优"}】\n`
+				: "";
+		const body = `${modeHint}${task}`;
+		// 右栏可见：用户委托条
+		broadcast({ type: "assistant_message", message: { role: "user", text: `〔剧情委托〕${task}` } });
+		try {
+			if (req.signal?.aborted) {
+				return {
+					ok: false,
+					summary: "已取消。",
+					media: [],
+					panelsWritten: [],
+					abandoned: true,
+					error: "aborted",
+				};
+			}
+			const onAbort = () => {
+				void assistantHost?.abort();
+			};
+			req.signal?.addEventListener("abort", onAbort, { once: true });
+			try {
+				// 等到 return_answer / 放弃 / 兜底交回（非仅等 agent_end 摘最后一句）
+				const ret = await assistantHost.runTask(body);
+				return {
+					ok: ret.ok !== false && !ret.abandoned,
+					summary: ret.summary,
+					media: [],
+					panelsWritten: [],
+					abandoned: ret.abandoned,
+					viaReturnTool: ret.viaReturnTool,
+					...(ret.ok === false || ret.abandoned ? { error: ret.abandoned ? "abandoned" : "failed" } : {}),
+				};
+			} finally {
+				req.signal?.removeEventListener("abort", onAbort);
+			}
+		} catch (err) {
+			const msg = err instanceof Error ? err.message : String(err);
+			return {
+				ok: false,
+				summary: `助手执行失败：${msg}`,
+				media: [],
+				panelsWritten: [],
+				error: msg,
+			};
+		}
+	});
 	console.log(`[liyuan] 助手会话已就位（${assistantHost.modelInfo() ? `${assistantHost.modelInfo()!.provider}/${assistantHost.modelInfo()!.id}` : "暂无模型"}${assistantHost.follows() ? "，跟随剧情模型" : ""}）`);
 } catch (err) {
+	registerAssistantRunner(null);
 	console.error(`[liyuan] 助手会话启动失败（面板不可用，剧情不受影响）：${err instanceof Error ? err.message : String(err)}`);
 }
 
@@ -1702,12 +1806,9 @@ const handlePrompt = async (text: string) => {
 		return;
 	}
 
-	// 场外标记 → 改道右栏助手会话（2026-07-14 职责拆分：剧情会话不再有戏内/戏外双姿态，
-	// 剧情模型只演戏；系统事务归助手。旧会话里遗留的戏外轮仅由 wire 历史渲染兜底。）
-	if (isBackstageText(trimmed)) {
-		await promptAssistant(stripBackstageMarker(trimmed));
-		return;
-	}
+	// 2026-07-18 合流：主框一律进剧情 agent；// 与整段括号不再硬改道。
+	// 系统事务由剧情侧 assistant_run 工具委托右栏助手（语义判断，非标记路由）。
+	// isBackstageText 仍用于：旧会话历史折叠、楼层、场记跳过。
 
 	const isCommand = trimmed.startsWith("/");
 	if (!isCommand) {
@@ -1773,11 +1874,14 @@ const isSameSessionPath = (a: string | undefined, b: string | undefined): boolea
 /**
  * 仅列**当前角色卡**下的会话（全部对话按卡绑定，不再有「未标记」分组）。
  * - 有 rp-card 且路径=当前卡 → 列出
- * - 其他卡 → 隐藏
+ * - 其他卡 → 隐藏（即使是「当前打开」也不把同卡以外的旁支拉进列表）
  * - 无标记：不列入（session_start 会补写）
- * - 当前打开的会话：按 sessionId / 路径始终列出并标 current（新建后列表必须立刻有「当前会话」）
+ * - 当前打开且绑定当前卡：标 current；当前打开却属其它卡：不列入（应已被 switchToCard 切走）
+ * - 列表为空且进程有打开会话 → 兜底补一条「当前会话」
  */
 const sessionInfos = async () => {
+	// 每次列表前刷新卡路径，避免换卡后仍用旧 cardPath 滤错
+	refreshNamesFromConfig();
 	const all = await SessionManager.list(cwd);
 	const curFile = session.sessionFile;
 	const curId = session.sessionId;
@@ -1791,7 +1895,12 @@ const sessionInfos = async () => {
 		current: boolean;
 		preview?: string;
 		cardName: string;
+		card?: string;
 	}> = [];
+	const belongsHere = (card: string | undefined) => {
+		if (!cardPath) return false; // 未配置卡：不铺开历史
+		return sameCardPath(card, cardPath, cwd);
+	};
 	for (const s of all) {
 		const mtime = s.modified instanceof Date ? s.modified.getTime() : Number(s.modified) || 0;
 		// 新建后 mtime 刚变：清掉可能过期的卡缓存再读
@@ -1801,8 +1910,11 @@ const sessionInfos = async () => {
 		}
 		const info = readSessionCard(s.path, mtime);
 		const isCurrent = s.id === curId || isSameSessionPath(s.path, curFile);
-		if (info && info.card !== cardPath && !isCurrent) continue; // 其他卡
-		if (!info && !isCurrent) continue; // 无卡标记且非当前
+		// 严格按卡过滤：其它卡一律不出现（含「当前打开却属其它卡」——由换卡流程切会话）
+		if (!info || !belongsHere(info.card)) {
+			// 仅当「当前会话尚未打上标记」时保留入口，避免新建后列表空白
+			if (!(isCurrent && !info && cardPath)) continue;
+		}
 		const preview = readSessionPreview(s.path, mtime);
 		list.push({
 			path: s.path,
@@ -1814,66 +1926,77 @@ const sessionInfos = async () => {
 			current: isCurrent,
 			...(preview ? { preview } : {}),
 			cardName: info?.name || names.charName,
+			...(info?.card ? { card: info.card } : cardPath ? { card: cardPath } : {}),
 		});
 	}
-	// 兜底：列表里没有任何 current，但进程确有打开会话 → 按 id/路径补一条
+	// 兜底：列表里没有任何 current，但进程确有打开会话 → 按 id/路径补一条（须属当前卡或无标记）
 	if (curId && !list.some((x) => x.current)) {
 		const mine = all.find((s) => s.id === curId || isSameSessionPath(s.path, curFile));
 		if (mine) {
 			const mtime = mine.modified instanceof Date ? mine.modified.getTime() : Number(mine.modified) || 0;
 			const info = readSessionCard(mine.path, mtime);
-			const preview = readSessionPreview(mine.path, mtime);
-			const existing = list.find((x) => x.id === mine.id || isSameSessionPath(x.path, mine.path));
-			if (existing) {
-				existing.current = true;
+			// 打开中的会话若明确属于其它卡：不塞进本卡列表（避免「切卡后仍见旧卡」）
+			if (info && !belongsHere(info.card)) {
+				// skip foreign current
 			} else {
-				list.push({
-					path: mine.path,
-					id: mine.id,
-					...(mine.name ? { name: mine.name } : {}),
-					firstMessage: mine.firstMessage,
-					modified: mtime,
-					messageCount: mine.messageCount,
-					current: true,
-					...(preview ? { preview } : {}),
-					cardName: info?.name || names.charName,
-				});
+				const preview = readSessionPreview(mine.path, mtime);
+				const existing = list.find((x) => x.id === mine.id || isSameSessionPath(x.path, mine.path));
+				if (existing) {
+					existing.current = true;
+				} else {
+					list.push({
+						path: mine.path,
+						id: mine.id,
+						...(mine.name ? { name: mine.name } : {}),
+						firstMessage: mine.firstMessage,
+						modified: mtime,
+						messageCount: mine.messageCount,
+						current: true,
+						...(preview ? { preview } : {}),
+						cardName: info?.name || names.charName,
+						...(info?.card ? { card: info.card } : cardPath ? { card: cardPath } : {}),
+					});
+				}
 			}
 		} else {
 			// 惰性落盘：首条 assistant 前会话文件可能尚未出现在 SessionManager.list
-			// （_persist 无 assistant 时不写盘）。新建后列表仍须立刻有「当前会话」。
 			let cardName = names.charName;
+			let boundCard = cardPath;
 			try {
 				const entries = session.sessionManager.getEntries() as Array<{
 					type?: string;
 					customType?: string;
-					data?: { name?: string };
+					data?: { name?: string; card?: string };
 				}>;
 				for (let i = entries.length - 1; i >= 0; i--) {
 					const e = entries[i];
-					if (e?.type === "custom" && e.customType === "rp-card" && typeof e.data?.name === "string" && e.data.name) {
-						cardName = e.data.name;
+					if (e?.type === "custom" && e.customType === "rp-card") {
+						if (typeof e.data?.name === "string" && e.data.name) cardName = e.data.name;
+						if (typeof e.data?.card === "string" && e.data.card) boundCard = e.data.card;
 						break;
 					}
 				}
 			} catch {
 				// 极早期生命周期：回落显示名
 			}
-			let messageCount = 0;
-			try {
-				messageCount = session.messages?.length ?? 0;
-			} catch {
-				messageCount = 0;
+			if (!boundCard || belongsHere(boundCard)) {
+				let messageCount = 0;
+				try {
+					messageCount = session.messages?.length ?? 0;
+				} catch {
+					messageCount = 0;
+				}
+				list.push({
+					path: curFile || "",
+					id: curId,
+					firstMessage: "",
+					modified: Date.now(),
+					messageCount,
+					current: true,
+					cardName,
+					...(boundCard ? { card: boundCard } : {}),
+				});
 			}
-			list.push({
-				path: curFile || "",
-				id: curId,
-				firstMessage: "",
-				modified: Date.now(),
-				messageCount,
-				current: true,
-				cardName,
-			});
 		}
 	}
 	list.sort((a, b) => b.modified - a.modified);
@@ -1980,9 +2103,23 @@ wss.on("connection", (ws, req) => {
 						if (text) await handlePrompt(text);
 						break;
 					}
-					case "abort":
-						await session.abort();
+					case "abort": {
+						// 强制停止：按下即收敛 UI/选择卡，再撕掉本轮（剧情 + 委托中的助手）
+						for (const id of [...pendingChoices.keys()]) settleChoice(id, { stop: true });
+						const wasStreaming = session.isStreaming || (assistantHost?.isStreaming() ?? false);
+						if (session.isStreaming) broadcast({ type: "agent", state: "end" });
+						if (assistantHost?.isStreaming()) broadcast({ type: "assistant_state", state: "end" });
+						void session.abort().catch((err) => {
+							console.error(`[liyuan] abort 失败：${err instanceof Error ? err.message : String(err)}`);
+						});
+						void assistantHost?.abort().catch((err) => {
+							console.error(`[liyuan] assistant abort(on story stop) 失败：${err instanceof Error ? err.message : String(err)}`);
+						});
+						if (!wasStreaming) {
+							// 无流时仍可点停：无事发生
+						}
 						break;
+					}
 					case "reroll": {
 						if (refuseWhileStreaming(ws, "重新生成")) return;
 						const t = String(frame.text ?? "").trim();
@@ -2009,12 +2146,33 @@ wss.on("connection", (ws, req) => {
 						const path = String(frame.path ?? "");
 						if (!path || path === session.sessionFile) return;
 						await runtime.switchSession(path);
+						// 助手对齐该剧情会话（有绑定则打开，无则新建，避免接着旧助手上下文）
+						if (assistantHost) {
+							try {
+								await assistantHost.switchToStory(session.sessionId);
+								broadcast(assistantHelloFrame());
+							} catch (err) {
+								console.error(
+									`[liyuan] 助手对齐剧情会话失败：${err instanceof Error ? err.message : String(err)}`,
+								);
+							}
+						}
 						broadcast({ type: "notify", level: "info", text: "已切换会话" });
 						break;
 					}
 					case "new":
 						if (refuseWhileStreaming(ws, "新建会话")) return;
 						await runtime.newSession();
+						if (assistantHost) {
+							try {
+								await assistantHost.switchToStory(session.sessionId);
+								broadcast(assistantHelloFrame());
+							} catch (err) {
+								console.error(
+									`[liyuan] 助手对齐剧情会话失败：${err instanceof Error ? err.message : String(err)}`,
+								);
+							}
+						}
 						broadcast({ type: "notify", level: "info", text: "已新建会话" });
 						break;
 					case "choice_reply": {
@@ -2036,9 +2194,64 @@ wss.on("connection", (ws, req) => {
 						if (t) await promptAssistant(t);
 						break;
 					}
-					case "assistant_abort":
-						await assistantHost?.abort();
+					case "assistant_abort": {
+						if (assistantHost?.isStreaming()) {
+							// 助手侧同样：先解锁前端 busy，再后台撕流
+							broadcast({ type: "assistant_state", state: "end" });
+						}
+						void assistantHost?.abort().catch((err) => {
+							console.error(`[liyuan] assistant abort 失败：${err instanceof Error ? err.message : String(err)}`);
+						});
 						break;
+					}
+					case "assistant_sessions": {
+						if (!assistantHost) {
+							ws.send(JSON.stringify({ type: "assistant_sessions", list: [] } satisfies ServerFrame));
+							return;
+						}
+						const list = await assistantHost.listSessions();
+						ws.send(JSON.stringify({ type: "assistant_sessions", list } satisfies ServerFrame));
+						break;
+					}
+					case "assistant_open": {
+						if (!assistantHost) return;
+						const path = String(frame.path ?? "");
+						if (!path) return;
+						try {
+							await assistantHost.openSession(path);
+							broadcast(assistantHelloFrame());
+							broadcast({ type: "notify", level: "info", text: "已切换助手历史" });
+						} catch (err) {
+							ws.send(
+								JSON.stringify({
+									type: "notify",
+									level: "warning",
+									text: err instanceof Error ? err.message : String(err),
+								} satisfies ServerFrame),
+							);
+						}
+						break;
+					}
+					case "assistant_delete": {
+						if (!assistantHost) return;
+						const path = String(frame.path ?? "");
+						if (!path) return;
+						try {
+							await assistantHost.deleteSession(path);
+							const list = await assistantHost.listSessions();
+							broadcast({ type: "assistant_sessions", list });
+							broadcast({ type: "notify", level: "info", text: "已删除助手历史" });
+						} catch (err) {
+							ws.send(
+								JSON.stringify({
+									type: "notify",
+									level: "warning",
+									text: err instanceof Error ? err.message : String(err),
+								} satisfies ServerFrame),
+							);
+						}
+						break;
+					}
 					case "assistant_new":
 						if (!assistantHost) return;
 						if (assistantHost.isStreaming()) {
@@ -2047,6 +2260,7 @@ wss.on("connection", (ws, req) => {
 						}
 						await assistantHost.newConversation();
 						broadcast(assistantHelloFrame());
+						broadcast({ type: "assistant_sessions", list: await assistantHost.listSessions() });
 						break;
 					case "assistant_sync":
 						ws.send(JSON.stringify(assistantHelloFrame()));

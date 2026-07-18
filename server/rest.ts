@@ -190,14 +190,23 @@ export interface RestHost {
 	promptCommand(text: string): Promise<void>;
 	/** 排队执行斜杠命令（不等待完成；流式中自动排到本轮结束）。返回是否进入了排队 */
 	queueCommand(text: string): boolean;
-	/** 面板导入（柱 2 liyuan-panels 格式）：逐条领域层校验写入当前会话，返回成功数/成功名单/逐条错误 */
-	importPanels(list: Array<{ name?: unknown; kind?: unknown; content?: unknown }>): {
+	/** 面板导入（柱 2 liyuan-panels 格式）：写盘并 await panelsync 收编扩展内存 */
+	importPanels(list: Array<{ name?: unknown; kind?: unknown; content?: unknown }>): Promise<{
 		imported: number;
 		names: string[];
 		errors: string[];
-	};
+	}>;
 	/** 用户收起/删除面板（同 panel_close：归档出活跃列表，盘上保留，同名重写可重开） */
-	closePanel(name: string): void;
+	closePanel(name: string): Promise<void>;
+	/**
+	 * 用户手改面板 content（A：通用源码编辑）。
+	 * 须已有活跃面板；kind 可改（默认保留原 kind）。写盘 + 收编扩展内存 + 树快照。
+	 */
+	savePanel(input: {
+		name: string;
+		content: string;
+		kind?: string;
+	}): Promise<{ name: string; kind: string; updatedAt: number }>;
 	/** 当前剧情分支上挂载的知识库名（会话树 rp-codex 快照，随 rewind/fork 走） */
 	mountedCodexes(): string[];
 	// ---- 会话管理（PLAN-PANELS §2.1，main.ts 实现） ----
@@ -208,8 +217,8 @@ export interface RestHost {
 	deleteCardSessions(cardRel: string): Promise<number>;
 	readSessionFile(path: string): Promise<string>;
 	searchSessions(q: string): Promise<SessionSearchHit[]>;
-	/** 世界状态用户主权编辑（applyPatch 语义，落盘+树快照经命令桥） */
-	applyStatePatch(patch: Record<string, unknown>): { applied: string[]; warnings: string[] };
+	/** 世界状态用户主权编辑（applyPatch 语义，落盘+ await statesync） */
+	applyStatePatch(patch: Record<string, unknown>): Promise<{ applied: string[]; warnings: string[] }>;
 	notify(level: "info" | "warning" | "error", text: string): void;
 	/** 世界线时间线视图（会话树 rp-save + 旁路 meta） */
 	worldlineView(): import("../src/worldline.ts").WorldlineView;
@@ -1385,7 +1394,7 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
 				if (!list || list.length === 0) {
 					throw new Error('格式不对：需要 liyuan-panels JSON（{"format":"liyuan-panels","version":1,"panels":[{"name","kind","content"}]}）');
 				}
-				const result = host.importPanels(list);
+				const result = await host.importPanels(list);
 				if (result.imported > 0) {
 					host.notify("info", `已导入 ${result.imported} 个面板${result.errors.length ? `（${result.errors.length} 个失败）` : ""}`);
 				}
@@ -1396,9 +1405,25 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
 			case "DELETE /api/panels": {
 				const name = (query.get("name") ?? "").trim();
 				if (!name) throw new Error("缺少 name");
-				host.closePanel(name);
+				await host.closePanel(name);
 				host.notify("info", `已删除面板「${name}」`);
 				sendJson(res, 200, { ok: true, name });
+				return true;
+			}
+			// 用户手改面板源码（markdown/svg/html 通用）：写盘 + 收编，下轮 agent 可见
+			case "PUT /api/panels": {
+				const body = JSON.parse(await readBody(req)) as {
+					name?: unknown;
+					content?: unknown;
+					kind?: unknown;
+				};
+				const name = typeof body.name === "string" ? body.name.trim() : "";
+				if (!name) throw new Error("缺少 name");
+				if (typeof body.content !== "string") throw new Error("缺少 content");
+				const kind = typeof body.kind === "string" && body.kind.trim() ? body.kind.trim() : undefined;
+				const saved = await host.savePanel({ name, content: body.content, kind });
+				host.notify("info", `已保存面板「${saved.name}」`);
+				sendJson(res, 200, { ok: true, ...saved });
 				return true;
 			}
 
@@ -1610,7 +1635,7 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
 				if (refuseWhileStreaming()) return true;
 				const body = JSON.parse(await readBody(req)) as { patch?: Record<string, unknown> };
 				if (!body.patch || typeof body.patch !== "object") throw new Error("缺少 patch");
-				const r = host.applyStatePatch(body.patch);
+				const r = await host.applyStatePatch(body.patch);
 				sendJson(res, 200, r);
 				return true;
 			}

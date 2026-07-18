@@ -9,9 +9,9 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { apiGet, type ModelsResponse } from "../api.ts";
-import type { AssistantModelInfo, AssistantMsg, WireActivity } from "../wire.ts";
+import type { AssistantModelInfo, AssistantMsg, AssistantSessionInfo, WireActivity } from "../wire.ts";
 import { LiveSteps, RichContent, ThinkingBlock, ZoomImg } from "./Messages.tsx";
-import { IconPlus, IconSend, IconStop } from "./icons.tsx";
+import { IconPlus, IconSend, IconStop, IconTrash } from "./icons.tsx";
 
 /** 助手交付的媒体（show_media）：图片走 lightbox，音视频走原生播放器 */
 function AsstMedia({ media }: { media: NonNullable<AssistantMsg["media"]> }) {
@@ -37,6 +37,19 @@ function AsstMedia({ media }: { media: NonNullable<AssistantMsg["media"]> }) {
 	);
 }
 
+function timeAgo(ms: number): string {
+	const diff = Date.now() - ms;
+	if (diff < 90_000) return "刚刚";
+	if (diff < 3_600_000) return `${Math.round(diff / 60_000)} 分钟前`;
+	if (diff < 86_400_000) return `${Math.round(diff / 3_600_000)} 小时前`;
+	if (diff < 30 * 86_400_000) return `${Math.round(diff / 86_400_000)} 天前`;
+	return new Date(ms).toLocaleDateString();
+}
+
+function sessionTitle(s: { name?: string; firstMessage: string; preview?: string }): string {
+	return s.name || s.preview || s.firstMessage.slice(0, 40) || "（空对话）";
+}
+
 export interface AssistantPanelProps {
 	/** null=尚未同步（连接前） */
 	msgs: AssistantMsg[] | null;
@@ -51,9 +64,14 @@ export interface AssistantPanelProps {
 	model: AssistantModelInfo | null;
 	/** true=跟随剧情模型 */
 	follow: boolean;
+	/** 当前角色卡下的助手历史（null=未拉） */
+	sessions: AssistantSessionInfo[] | null;
 	onSend(text: string): void;
 	onAbort(): void;
 	onNew(): void;
+	onRefreshSessions(): void;
+	onOpenSession(path: string): void;
+	onDeleteSession(path: string): void;
 	/** null=回到跟随剧情模型 */
 	onPickModel(sel: { provider: string; id: string } | null): void;
 }
@@ -137,13 +155,18 @@ export function AssistantPanel({
 	liveActs,
 	model,
 	follow,
+	sessions,
 	onSend,
 	onAbort,
 	onNew,
+	onRefreshSessions,
+	onOpenSession,
+	onDeleteSession,
 	onPickModel,
 }: AssistantPanelProps) {
 	const [input, setInput] = useState("");
 	const [models, setModels] = useState<ModelsResponse | null>(null);
+	const [histOpen, setHistOpen] = useState(false);
 	const listRef = useRef<HTMLDivElement>(null);
 	const stickRef = useRef(true);
 
@@ -158,6 +181,12 @@ export function AssistantPanel({
 		return () => {
 			alive = false;
 		};
+	}, []);
+
+	// 打开面板时拉一次助手历史（按当前卡）
+	useEffect(() => {
+		onRefreshSessions();
+		// eslint-disable-next-line react-hooks/exhaustive-deps -- 仅挂载拉一次；之后由历史按钮/刷新触发
 	}, []);
 
 	// 贴底跟随：用户没有主动上翻时，新内容到达自动滚到底
@@ -191,6 +220,8 @@ export function AssistantPanel({
 		return [...map.entries()];
 	}, [models]);
 
+	const histCount = sessions?.length ?? 0;
+
 	return (
 		<div className="asst-panel">
 			<div className="asst-toolbar">
@@ -223,17 +254,81 @@ export function AssistantPanel({
 				</label>
 				<button
 					type="button"
+					className={`icon-btn ${histOpen ? "active" : ""}`}
+					onClick={() => {
+						setHistOpen((o) => !o);
+						onRefreshSessions();
+					}}
+					title="本角色卡的助手历史"
+					aria-label="助手历史"
+					aria-expanded={histOpen}
+				>
+					历史{histCount > 0 ? ` ${histCount}` : ""}
+				</button>
+				<button
+					type="button"
 					className="icon-btn"
 					onClick={onNew}
 					disabled={busy}
-					title="新对话（当前助手对话归档，不影响剧情）"
+					title="新对话（当前助手对话归档，绑定当前角色卡）"
 					aria-label="助手新对话"
 				>
 					<IconPlus size={16} />
 				</button>
 			</div>
+			{histOpen && (
+				<div className="asst-history">
+					<div className="asst-history-head">
+						<span>本卡助手历史</span>
+						<button type="button" className="welcome-link" onClick={onRefreshSessions}>
+							刷新
+						</button>
+					</div>
+					{sessions === null && <div className="sp-empty">读取历史…</div>}
+					{sessions !== null && sessions.length === 0 && (
+						<div className="sp-empty">当前角色卡还没有助手对话</div>
+					)}
+					{sessions !== null &&
+						sessions.map((s) => (
+							<div key={s.path || s.id} className={`asst-hist-row ${s.current ? "current" : ""}`}>
+								<button
+									type="button"
+									className="asst-hist-item"
+									disabled={busy || s.current}
+									title={s.current ? "当前对话" : "打开此历史"}
+									onClick={() => {
+										if (!s.current && s.path) onOpenSession(s.path);
+										setHistOpen(false);
+									}}
+								>
+									<span className="asst-hist-title">
+										{sessionTitle(s)}
+										{s.current ? <span className="session-current-badge">当前</span> : null}
+									</span>
+									<span className="asst-hist-meta">
+										{timeAgo(s.modified)} · {s.messageCount} 条
+									</span>
+								</button>
+								{!s.current && s.path && (
+									<button
+										type="button"
+										className="act"
+										title="删除此历史"
+										aria-label="删除助手历史"
+										disabled={busy}
+										onClick={() => {
+											if (window.confirm("删除这条助手历史？不可恢复。")) onDeleteSession(s.path);
+										}}
+									>
+										<IconTrash size={13} />
+									</button>
+								)}
+							</div>
+						))}
+				</div>
+			)}
 			<div className="asst-hint">
-				剧情尺度较大时，建议为助手单独选择宽容一些的模型（拒答与剧情模型解耦）。
+				助手历史按当前角色卡过滤；换卡后只看该卡下的运维记录。
 			</div>
 
 			<div
@@ -248,8 +343,8 @@ export function AssistantPanel({
 				{msgs === null && <div className="sp-empty">连接后台中…</div>}
 				{msgs !== null && blocks.length === 0 && !busy && (
 					<div className="sp-empty">
-						这里是系统助手：诊断回复质量、调配置与预设、维护记忆、接外部服务，都可以直接吩咐。
-						它能看到剧情记录，但绝不代写剧情。在主输入框用 // 开头说话也会转到这里。
+						这里是系统助手：诊断、调配置、维护记忆、接外部服务，都可以直接吩咐。
+						主输入框里的系统事务也会由剧情侧委托过来；历史按当前角色卡归档。
 					</div>
 				)}
 				{doneBlocks.map((b, i) =>

@@ -11,7 +11,7 @@
  * 内容中立：清洗作用于标签结构，正文文本是穿过管道的不透明字符串。
  */
 
-import { STRIP_BLOCK_TAGS, UNWRAP_BLOCK_TAGS } from "./postprocess.ts";
+import { cleanAssistantText } from "./postprocess.ts";
 
 export interface StChatMeta {
 	userName: string;
@@ -83,17 +83,21 @@ export function parseStChat(jsonlText: string): ParsedStChat {
 
 
 export interface CleanRules {
-	/** 正文提取标签：设置后只保留 <tag>…</tag> 之间的内容（多段拼接）；无命中时回退为剥离模式 */
+	/** 正文提取标签：设置后只保留 <tag>…</tag> 之间的内容（多段拼接）；无命中时回退为策略清洗 */
 	extractTag?: string;
-	/** 需要整块剥离的标签（默认与 postprocess 共享：思维链/分析/状态栏类） */
+	/**
+	 * 额外整块剥离的标签名（叠加在策略引擎之上）。
+	 * 默认空——fold/panel/strip/unwrap 由 postprocess 处理，无需枚举。
+	 */
 	stripTags?: string[];
 }
 
-export const DEFAULT_STRIP_TAGS = STRIP_BLOCK_TAGS;
+/** @deprecated 策略引擎后默认不再靠名单；保留空数组兼容旧调用 */
+export const DEFAULT_STRIP_TAGS: string[] = [];
 
 const escapeReg = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
-/** 清洗单条消息文本：提取正文标签或剥离噪声标签，拆正文容器包装，去 HTML 注释，收敛空行 */
+/** 清洗单条消息：可选 extractTag；其余走 postprocess 策略引擎 */
 export function cleanChatText(text: string, rules: CleanRules = {}): string {
 	let t = text;
 
@@ -106,26 +110,15 @@ export function cleanChatText(text: string, rules: CleanRules = {}): string {
 		if (parts.length > 0) {
 			t = parts.join("\n\n");
 		}
-		// 无命中则回退：模型偶尔忘写标签的轮次按剥离模式处理
 	}
 
-	for (const tag of rules.stripTags ?? DEFAULT_STRIP_TAGS) {
+	for (const tag of rules.stripTags ?? []) {
 		const k = escapeReg(tag);
 		t = t.replace(new RegExp(`<${k}(?:\\s[^>]*)?>[\\s\\S]*?</${k}>`, "gi"), "");
-		// 未闭合的悬挂开标签：剥到文本末尾（截断输出的常见残留）
 		t = t.replace(new RegExp(`<${k}(?:\\s[^>]*)?>[\\s\\S]*$`, "gi"), "");
 	}
 
-	// 正文容器标签只拆包装保留内容（<plot> 等）
-	for (const tag of UNWRAP_BLOCK_TAGS) {
-		const k = escapeReg(tag);
-		t = t.replace(new RegExp(`<${k}(?:\\s[^>]*)?>([\\s\\S]*?)</${k}>`, "gi"), "$1");
-		t = t.replace(new RegExp(`</?${k}(?:\\s[^>]*)?>`, "gi"), "");
-	}
-
-	t = t.replace(/<!--[\s\S]*?-->/g, "");
-	t = t.replace(/\n{3,}/g, "\n\n");
-	return t.trim();
+	return cleanAssistantText(t);
 }
 
 /** 批量清洗，丢弃清洗后为空的消息 */

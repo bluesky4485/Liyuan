@@ -2922,7 +2922,95 @@ input.panel-search.num {
 
 /* ── Agent 自建面板(柱 2) ── */
 
+/* 侧栏面板内媒体：统一视口，避免助手生成的大图/SVG 撑破 */
+.panel-body img,
+.panel-body video,
+.panel-body svg {
+	max-width: 100%;
+	height: auto;
+}
+.panel-body iframe {
+	max-width: 100%;
+}
+
 /* svg/html 面板:全锁沙箱 iframe 充满面板体 */
+/* agent 面板：工具条 + 源码编辑（方案 A） */
+.artifact-root {
+	display: flex;
+	flex-direction: column;
+	flex: 1 1 auto;
+	min-height: 0;
+	overflow: hidden;
+}
+.artifact-toolbar {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	flex-wrap: wrap;
+	padding: 8px 12px;
+	border-bottom: 1px solid var(--hairline);
+	background: var(--surface-dim);
+	flex-shrink: 0;
+}
+.artifact-kind-chip {
+	font-size: 11px;
+	font-weight: 600;
+	letter-spacing: 0.02em;
+	text-transform: uppercase;
+	color: var(--text-soft);
+	background: var(--surface);
+	border: 1px solid var(--hairline-strong);
+	border-radius: 999px;
+	padding: 2px 8px;
+}
+.artifact-kind-select {
+	font: inherit;
+	font-size: 11px;
+	font-weight: 600;
+	text-transform: uppercase;
+	border: none;
+	background: transparent;
+	color: inherit;
+	padding: 0;
+	margin: 0;
+	cursor: pointer;
+}
+.artifact-toolbar-hint {
+	flex: 1 1 auto;
+	font-size: 12px;
+	color: var(--text-faint);
+	min-width: 0;
+}
+.artifact-toolbar-actions {
+	display: flex;
+	gap: 6px;
+	flex-shrink: 0;
+}
+.artifact-err {
+	padding: 6px 12px;
+	font-size: 12px;
+	color: var(--accent-strong);
+	background: var(--accent-wash);
+	border-bottom: 1px solid var(--hairline);
+}
+.artifact-editor {
+	flex: 1 1 auto;
+	min-height: 160px;
+	width: 100%;
+	box-sizing: border-box;
+	margin: 0;
+	padding: 12px 14px;
+	border: none;
+	resize: none;
+	font: 13px/1.55 ui-monospace, "SF Mono", "Cascadia Code", "Consolas", monospace;
+	color: var(--text-strong);
+	background: var(--surface);
+	outline: none;
+}
+.artifact-editor:focus {
+	box-shadow: inset 0 0 0 1px var(--accent);
+}
+
 .artifact-frame-wrap {
 	padding: 0;
 	display: flex;
@@ -6093,6 +6181,81 @@ label.drawer-btn {
 .asst-model select:focus-visible {
 	outline: none;
 	border-color: color-mix(in srgb, var(--accent) 40%, var(--hairline-strong));
+}
+
+.asst-history {
+	max-height: 220px;
+	overflow-y: auto;
+	border-bottom: 1px solid var(--hairline);
+	padding: 4px 10px 10px;
+	background: color-mix(in srgb, var(--surface) 88%, var(--bg));
+}
+.asst-history-head {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	padding: 4px 4px 8px;
+	font-size: 11.5px;
+	font-weight: 600;
+	color: var(--text-muted);
+}
+.asst-hist-row {
+	display: flex;
+	align-items: stretch;
+	gap: 4px;
+	margin-bottom: 4px;
+}
+.asst-hist-row.current .asst-hist-item {
+	border-color: color-mix(in srgb, var(--accent) 35%, var(--hairline-strong));
+	background: color-mix(in srgb, var(--accent) 8%, var(--surface));
+}
+.asst-hist-item {
+	flex: 1;
+	min-width: 0;
+	text-align: left;
+	border: 1px solid var(--hairline);
+	border-radius: 10px;
+	background: var(--surface);
+	padding: 8px 10px;
+	cursor: pointer;
+	font: inherit;
+	color: var(--text);
+}
+.asst-hist-item:disabled {
+	cursor: default;
+	opacity: 1;
+}
+.asst-hist-item:not(:disabled):hover {
+	border-color: color-mix(in srgb, var(--accent) 30%, var(--hairline-strong));
+}
+.asst-hist-title {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	font-size: 12.5px;
+	font-weight: 500;
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+.asst-hist-meta {
+	display: block;
+	margin-top: 3px;
+	font-size: 11px;
+	color: var(--text-faint);
+}
+.asst-hist-row .act {
+	flex-shrink: 0;
+	border: 0;
+	background: transparent;
+	color: var(--text-faint);
+	border-radius: 8px;
+	padding: 6px;
+	cursor: pointer;
+}
+.asst-hist-row .act:hover {
+	color: var(--danger, #c44);
+	background: color-mix(in srgb, var(--danger, #c44) 10%, transparent);
 }
 
 .asst-hint {

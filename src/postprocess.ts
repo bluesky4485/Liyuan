@@ -1,68 +1,183 @@
 /**
- * 输出后处理
+ * 输出后处理——**策略引擎**，不靠无穷标签白名单。
  *
- * 1) cleanAssistantText：送往 LLM 的历史卫生（D9 few-shot 防增殖；会话文件仍保留原文）
- * 2) displayAssistantText：Web 显示层——剥「假思维链/草稿/注释/正文包装」，
- *    **保留状态栏标签**（StatusBlock / normal_status / special_status）给前端面板渲染。
+ * 预设会发明任意标签（thinking / 正文 / scene / 自定义中文…）。枚举不过来，因此：
+ *
+ * | 策略 | 显示 | 送模历史 | 判定 |
+ * |------|------|----------|------|
+ * | **fold** | 进思维链折叠，正文去掉 | 整块删除 | 名称像思考/草稿/分析，或预设自动发现 |
+ * | **panel** | 保留标签给前端画状态卡 | 整块删除 | 名称像状态栏 |
+ * | **strip** | 标签+内容都隐去 | 整块删除 | 名称像 jailbreak/仪式回显 |
+ * | **unwrap** | 去掉标签、**内容当正文渲染** | 去掉标签留内容 | **默认**——所有未识别标签 |
+ *
+ * 新标签默认 unwrap：正文不丢、标签不刺眼；真要折叠的靠名称模式或从预设发现。
  */
 
-/** 送模历史：整块剥离（含状态栏，避免 few-shot 增殖） */
-export const STRIP_BLOCK_TAGS = [
-	"descriptive_analysis",
-	"normal_status",
-	"special_status",
-	"thinking",
-	"think",
-	"draft_notes",
-	"draft",
-	"reasoning",
-	"status",
-	"statusbar",
-	"StatusBlock",
-	"status_block",
-	"statusblock",
-];
+export type TagPolicy = "fold" | "panel" | "strip" | "unwrap";
+
+/** 标签名：字母/中文起头，允许数字 _ - . 与中文（兼容 <haurki准则> <draft_notes>） */
+const TAG_NAME = String.raw`[A-Za-z_\u4e00-\u9fff][\w\u4e00-\u9fff.\-]*`;
+
+/** 开标签（非闭合、非注释、非 DOCTYPE） */
+const OPEN_TAG_RE = new RegExp(`<(${TAG_NAME})(\\s[^>]*)?>`, "g");
+
+// —— 名称模式（类，不是枚举每一个标签）——
+/** 思考 / 草稿 / 分析 → 折叠 */
+const FOLD_NAME_RE =
+	/^(?:thinking|think|thoughts?|draft(?:_?notes)?|reasoning|reason(?:ing)?|analysis|analy[sz]e|descriptive_?analysis|cot|chain_?of_?thought|scaffold|memo|notes?|推演|思考|思维|草稿|分析|笔记|备忘|内心推演)$/i;
+/** 状态栏 → 面板 */
+const PANEL_NAME_RE =
+	/^(?:status(?:_?block|bar)?|normal_?status|special_?status|char(?:acter)?_?status|状态|状态栏|人物状态|场景状态)$/i;
+/** 仪式/越狱回显 → 整块扔掉 */
+const STRIP_NAME_RE = /^(?:haurki|haurki准则|jailbreak|system_?prompt|oai_?system|anti_?reject)$/i;
 
 /**
- * 仅显示层剥掉的脚手架（用户不该当正文读的假思维/草稿）。
- * 注意：不含 StatusBlock / normal_status / special_status——那些要进状态面板。
+ * 运行时额外 fold 标签（小写）。由预设扫描写入——预设写了「必须先输出 <foo>」就把 foo 当思维链。
  */
-export const DISPLAY_STRIP_SCAFFOLD_TAGS = [
-	"descriptive_analysis",
-	"thinking",
-	"think",
-	"draft_notes",
-	"draft",
-	"reasoning",
-];
+const extraFold = new Set<string>();
+/** 运行时额外 panel（小写） */
+const extraPanel = new Set<string>();
 
-/** 只拆包装保留内容（正文容器类） */
-export const UNWRAP_BLOCK_TAGS = ["plot", "splot", "content", "narrative", "main", "story", "正文"];
+export function resetDisplayTagExtras(): void {
+	extraFold.clear();
+	extraPanel.clear();
+}
+
+export function addFoldTags(tags: Iterable<string>): void {
+	for (const t of tags) {
+		const n = normalizeTagName(t);
+		if (n) extraFold.add(n);
+	}
+}
+
+export function addPanelTags(tags: Iterable<string>): void {
+	for (const t of tags) {
+		const n = normalizeTagName(t);
+		if (n) extraPanel.add(n);
+	}
+}
+
+export function normalizeTagName(tag: string): string {
+	return tag.trim().toLowerCase().replace(/_/g, "");
+}
+
+/** 名称 → 策略（先 extra，再模式，默认 unwrap） */
+export function classifyTag(tag: string): TagPolicy {
+	const raw = tag.trim();
+	const norm = normalizeTagName(raw);
+	if (!norm) return "unwrap";
+	if (extraFold.has(norm) || extraFold.has(raw.toLowerCase())) return "fold";
+	if (extraPanel.has(norm) || extraPanel.has(raw.toLowerCase())) return "panel";
+	// 模式匹配用「去下划线」与原文各试一次
+	if (FOLD_NAME_RE.test(raw) || FOLD_NAME_RE.test(norm)) return "fold";
+	if (PANEL_NAME_RE.test(raw) || PANEL_NAME_RE.test(norm)) return "panel";
+	if (STRIP_NAME_RE.test(raw) || STRIP_NAME_RE.test(norm)) return "strip";
+	return "unwrap";
+}
+
+export interface TaggedBlock {
+	tag: string;
+	policy: TagPolicy;
+	body: string;
+	/** 含开闭标签的原文切片 */
+	raw: string;
+	start: number;
+	end: number;
+	/** 无闭合、吃到文末 */
+	hanging: boolean;
+}
+
+/**
+ * 从预设/指令正文里发现「应折叠」的标签：模型被要求先输出的成对标签。
+ * 不追求完美 NLP——宁可少发现，漏网的仍可被名称模式兜住。
+ */
+export function discoverFoldTagsFromTexts(texts: string[]): string[] {
+	const found = new Set<string>();
+	const cue =
+		/(?:思考过程|思维链|思考格式|draft_notes|thinking|先(?:必须)?输出|必须输出|输出以下|最先必须|按下列格式|格式必须)/i;
+	for (const text of texts) {
+		if (!text) continue;
+		// 线索附近出现的开标签 → 视为脚手架
+		let idx = 0;
+		while (idx < text.length) {
+			const slice = text.slice(idx);
+			const m = cue.exec(slice);
+			if (!m) break;
+			const from = idx + m.index;
+			const window = text.slice(from, from + 240);
+			const openRe = new RegExp(`<(${TAG_NAME})(?:\\s[^>]*)?>`, "g");
+			let om: RegExpExecArray | null;
+			while ((om = openRe.exec(window)) !== null) {
+				found.add(om[1]);
+			}
+			idx = from + Math.max(m[0].length, 1);
+		}
+		// 指令里直接示范的成对思考标签（即便没有「思考」二字的邻接）
+		const pairRe = new RegExp(`<(${TAG_NAME})(?:\\s[^>]*)?>[\\s\\S]*?</\\1>`, "gi");
+		let pm: RegExpExecArray | null;
+		while ((pm = pairRe.exec(text)) !== null) {
+			const tag = pm[1];
+			const body = pm[0];
+			// 短示范块 + 名称像 meta，或出现在「格式」语境
+			if (FOLD_NAME_RE.test(tag) || /思考|思维|draft|分析|推演/i.test(body.slice(0, 80))) {
+				found.add(tag);
+			}
+		}
+	}
+	return [...found];
+}
+
+/** 扫描全文顶层成对/悬挂标签（不解析嵌套树，按出现顺序） */
+export function scanTaggedBlocks(text: string): TaggedBlock[] {
+	const blocks: TaggedBlock[] = [];
+	if (!text) return blocks;
+	OPEN_TAG_RE.lastIndex = 0;
+	let m: RegExpExecArray | null;
+	const opens: Array<{ tag: string; openStart: number; openEnd: number }> = [];
+	while ((m = OPEN_TAG_RE.exec(text)) !== null) {
+		// 跳过闭合误匹配（OPEN 已不含 /）
+		opens.push({ tag: m[1], openStart: m.index, openEnd: m.index + m[0].length });
+	}
+	// 贪心：每个开标签找其后第一个同名闭合；已被前块覆盖的跳过
+	let cursor = 0;
+	for (const o of opens) {
+		if (o.openStart < cursor) continue;
+		const closeRe = new RegExp(`</${escapeReg(o.tag)}\\s*>`, "i");
+		const rest = text.slice(o.openEnd);
+		const cm = closeRe.exec(rest);
+		if (cm && cm.index >= 0) {
+			const body = rest.slice(0, cm.index);
+			const end = o.openEnd + cm.index + cm[0].length;
+			blocks.push({
+				tag: o.tag,
+				policy: classifyTag(o.tag),
+				body,
+				raw: text.slice(o.openStart, end),
+				start: o.openStart,
+				end,
+				hanging: false,
+			});
+			cursor = end;
+		} else {
+			// 悬挂：从开标签吃到文末（仅当这是最后一个未覆盖开标签）
+			blocks.push({
+				tag: o.tag,
+				policy: classifyTag(o.tag),
+				body: text.slice(o.openEnd),
+				raw: text.slice(o.openStart),
+				start: o.openStart,
+				end: text.length,
+				hanging: true,
+			});
+			cursor = text.length;
+			break;
+		}
+	}
+	return blocks;
+}
 
 const escapeReg = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
-function stripBlocks(text: string, tags: string[]): string {
-	let t = text;
-	for (const tag of tags) {
-		const k = escapeReg(tag);
-		t = t.replace(new RegExp(`<${k}(?:\\s[^>]*)?>[\\s\\S]*?</${k}>`, "gi"), "");
-		// 悬挂开标签（截断输出）：剥到末尾
-		t = t.replace(new RegExp(`<${k}(?:\\s[^>]*)?>[\\s\\S]*$`, "gi"), "");
-	}
-	return t;
-}
-
-function unwrapBlocks(text: string, tags: string[]): string {
-	let t = text;
-	for (const tag of tags) {
-		const k = escapeReg(tag);
-		t = t.replace(new RegExp(`<${k}(?:\\s[^>]*)?>([\\s\\S]*?)</${k}>`, "gi"), "$1");
-		t = t.replace(new RegExp(`</?${k}(?:\\s[^>]*)?>`, "gi"), "");
-	}
-	return t;
-}
-
-/** 空白收敛 */
 function tidyWhitespace(text: string): string {
 	return text
 		.replace(/[ \t]+$/gm, "")
@@ -70,50 +185,90 @@ function tidyWhitespace(text: string): string {
 		.trim();
 }
 
-/** 历史送模用：剥脚手架+状态栏，拆正文包装 */
+/**
+ * 按策略改写全文（多轮至稳定，处理「外壳 unwrap 后内层 thinking 才暴露」）。
+ * - fold/strip：删除整块（fold 的 body 另收集）
+ * - panel：原样保留（display）或删除（history）
+ * - unwrap：只留 body
+ */
+function applyPolicies(
+	text: string,
+	opts: { keepPanel: boolean; collectFold: boolean },
+): { text: string; foldParts: string[] } {
+	const foldParts: string[] = [];
+	let t = text;
+	for (let pass = 0; pass < 8; pass++) {
+		const blocks = scanTaggedBlocks(t);
+		if (blocks.length === 0) break;
+		// 本轮若只剩 panel 且 keepPanel，停止（避免死循环）
+		if (opts.keepPanel && blocks.every((b) => b.policy === "panel")) break;
+
+		let out = "";
+		let cursor = 0;
+		let changed = false;
+		for (const b of blocks) {
+			if (b.start > cursor) out += t.slice(cursor, b.start);
+			const policy = b.policy;
+			if (policy === "fold") {
+				const body = b.body.trim();
+				if (opts.collectFold && body) foldParts.push(body);
+				changed = true;
+			} else if (policy === "strip") {
+				changed = true;
+			} else if (policy === "panel") {
+				if (opts.keepPanel) out += b.raw;
+				else changed = true;
+			} else {
+				// unwrap：内容进正文（内层标签下轮再处理）
+				out += b.body;
+				changed = true;
+			}
+			cursor = b.end;
+		}
+		if (cursor < t.length) out += t.slice(cursor);
+		t = out;
+		if (!changed) break;
+	}
+	return { text: t, foldParts };
+}
+
+/** 历史送模：fold/panel/strip 整块扔；unwrap 拆包留内容 */
 export function cleanAssistantText(text: string): string {
-	let t = stripBlocks(text, STRIP_BLOCK_TAGS);
-	t = unwrapBlocks(t, UNWRAP_BLOCK_TAGS);
+	let t = applyPolicies(text, { keepPanel: false, collectFold: false }).text;
+	// HTML 注释（导演旁注）
+	t = t.replace(/<!--[\s\S]*?-->/g, "");
 	return tidyWhitespace(t);
 }
 
 /**
- * 显示层用：
- * - 剥假思维链 / 草稿 / 分析
- * - 拆 content/plot 包装，只留叙事
- * - **保留** StatusBlock / normal_status / special_status 给 RichContent 画状态面板
- * - 去掉 HTML 注释与「### 正文」分隔行
+ * 显示层：fold→思维链另抽；strip 扔；panel 保留；其余 unwrap。
+ * 另：HTML 注释、单独成行的「### 正文」类分隔。
  */
 export function displayAssistantText(text: string): string {
-	let t = text;
-	t = stripBlocks(t, DISPLAY_STRIP_SCAFFOLD_TAGS);
-	t = unwrapBlocks(t, UNWRAP_BLOCK_TAGS);
-	// ST/预设常用 HTML 注释作导演旁注（Prism 等）
+	let t = applyPolicies(text, { keepPanel: true, collectFold: false }).text;
 	t = t.replace(/<!--[\s\S]*?-->/g, "");
-	// 常见分隔标题（单独成行）
 	t = t.replace(/^\s*#{1,6}\s*正文\s*$/gim, "");
-	t = t.replace(/^\s*#{1,6}\s*(thinking|draft|notes?)\s*$/gim, "");
-	// 残留空标签行——但绝不能拆掉状态栏开闭标签（前端靠它们画面板）
-	t = t.replace(
-		/^\s*<\/?(?!(?:StatusBlock|status_block|statusblock|normal_status|special_status|status)\b)[A-Za-z][\w-]*\s*>\s*$/gim,
-		"",
-	);
+	t = t.replace(/^\s*#{1,6}\s*(thinking|draft|notes?|思维|草稿)\s*$/gim, "");
+	// 残留空标签行（非 panel——panel 需留给前端）
+	t = t.replace(new RegExp(`^\\s*</?(${TAG_NAME})(\\s[^>]*)?>\\s*$`, "gim"), (line, tag: string) => {
+		return classifyTag(tag) === "panel" ? line : "";
+	});
 	return tidyWhitespace(t);
 }
 
 /**
- * 从助手原文中抽出应折叠展示的「假思维链」块（供 UI ThinkingBlock）。
+ * 抽出应进 UI「思维链」折叠的内容（fold 策略块）。
  */
 export function extractScaffoldThinking(text: string): string {
-	const parts: string[] = [];
-	for (const tag of ["thinking", "think", "draft_notes", "draft", "reasoning", "descriptive_analysis"]) {
-		const k = escapeReg(tag);
-		const re = new RegExp(`<${k}(?:\\s[^>]*)?>([\\s\\S]*?)</${k}>`, "gi");
-		let m: RegExpExecArray | null;
-		while ((m = re.exec(text)) !== null) {
-			const body = m[1].trim();
-			if (body) parts.push(body);
-		}
-	}
-	return parts.join("\n\n---\n\n").trim();
+	const { foldParts } = applyPolicies(text, { keepPanel: true, collectFold: true });
+	return foldParts
+		.join("\n\n---\n\n")
+		.replace(new RegExp(`^\\s*</?(${TAG_NAME})(\\s[^>]*)?>\\s*$`, "gim"), "")
+		.trim();
 }
+
+// —— 兼容旧导出名（测试 / 外部若仍引用）——
+/** @deprecated 策略引擎后不再维护精确名单；保留空/示意避免破 import */
+export const STRIP_BLOCK_TAGS: string[] = [];
+export const DISPLAY_STRIP_SCAFFOLD_TAGS: string[] = [];
+export const UNWRAP_BLOCK_TAGS: string[] = [];

@@ -12,7 +12,9 @@
  * - D10：工具面不存在任何「写剧情正文」的通道；红线另在 src/stagehand.ts 提示词层钉死。
  */
 
-import { isAbsolute, join } from "node:path";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, openSync, readSync, closeSync, statSync, unlinkSync, writeFileSync, readFileSync } from "node:fs";
+import { isAbsolute, join, normalize, resolve } from "node:path";
 import {
 	createAgentSession,
 	DefaultResourceLoader,
@@ -36,7 +38,7 @@ import {
 } from "../src/codex.ts";
 import { appendOverlayEntry, overlayPathFor, searchEntries } from "../src/lorebook.ts";
 import { PANEL_KINDS } from "../src/panels.ts";
-import { dir } from "../src/paths.ts";
+import { dir, sameCardPath } from "../src/paths.ts";
 import { listSkills, saveSkill } from "../src/skills.ts";
 import {
 	buildStagehandInjection,
@@ -46,6 +48,8 @@ import {
 	STORY_COMMANDS,
 	type StorySnapshot,
 } from "../src/stagehand.ts";
+import { isAssistantDelegateActive } from "../src/assistant-gateway.ts";
+import { harvestLocalMediaPaths } from "../src/media-paths.ts";
 import { formatState } from "../src/state.ts";
 import type { RpConfig, WorldState } from "../src/types.ts";
 import {
@@ -58,7 +62,7 @@ import {
 	presetOverridePath,
 	writeJsonWithBackup,
 } from "./rest.ts";
-import { existsSync, mkdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { parseCardFromSessionHead } from "./wire.ts";
 
 /** 剧情会话桥：main.ts 提供，助手工具经此只读剧情面 / 提交白名单写操作 */
 export interface StoryBridge {
@@ -70,8 +74,8 @@ export interface StoryBridge {
 	queueStoryCommand(text: string): boolean;
 	/** 世界状态（当前剧情会话的账本） */
 	worldState(): WorldState;
-	/** 账本补丁（用户主权 applyPatch 通路，与 PUT /api/state 同源） */
-	applyStatePatch(patch: Record<string, unknown>): { applied: string[]; warnings: string[] };
+	/** 账本补丁（落盘 + await statesync） */
+	applyStatePatch(patch: Record<string, unknown>): Promise<{ applied: string[]; warnings: string[] }>;
 	/** 配置/预设变更后热载剧情会话（流式中自动排队） */
 	softRefreshConfig(): Promise<void>;
 	/** 可用模型清单 + 当前剧情模型（/api/models 同源） */
@@ -82,14 +86,19 @@ export interface StoryBridge {
 	// ---- 作者权限：写文件 + 收编进剧情会话（内存/树/前端）——与剧情 agent 落点一致 ----
 	/** 当前角色卡名（补充设定集按卡分文件、卡库落点用） */
 	cardName(): string;
-	/** 写面板（liyuan-panels 通路，落 .liyuan-artifacts + /panelsync 收编 + fs.watch 推前端） */
-	writePanels(list: Array<{ name: string; kind: string; content: string }>): {
+	/** 写面板（落盘 + await panelsync 收编剧情扩展内存） */
+	writePanels(list: Array<{ name: string; kind: string; content: string }>): Promise<{
 		imported: number;
 		names: string[];
 		errors: string[];
-	};
+	}>;
 	/** 把本机图片/音频/视频交付到助手自己的对话（复制进 .liyuan-media，返回可访问 src） */
 	deliverMedia(absPath: string): { ok: true; src: string; kind: "image" | "audio" | "video" } | { ok: false; error: string };
+	/**
+	 * 委托模式：把媒体同时推到剧情对话流（与 show_image 同源通道）。
+	 * 仅当剧情 agent 的 assistant_run 活跃时由 show_media 调用。
+	 */
+	emitStoryMedia?(media: { src: string; kind: "image" | "audio" | "video"; caption?: string }): void;
 	/** 收编世界书补充设定集改动进剧情会话（写文件后调，触发 /rprefresh 重载 lore） */
 	refreshStoryMaterials(): Promise<void>;
 	/** 收编知识库挂载变化（写文件后调，/codexmount 命令桥） */
@@ -101,12 +110,55 @@ export interface AssistantModelSel {
 	id: string;
 }
 
+/** 委托交回载荷（return_answer / 放弃 / 兜底） */
+export interface AssistantReturnPayload {
+	summary: string;
+	ok?: boolean;
+	abandoned?: boolean;
+	viaReturnTool?: boolean;
+}
+
+export interface AssistantSessionInfo {
+	path: string;
+	id: string;
+	name?: string;
+	firstMessage: string;
+	modified: number;
+	messageCount: number;
+	current: boolean;
+	preview?: string;
+	cardName?: string;
+	card?: string;
+	/** 绑定的剧情会话 id（一对一，避免跨剧情聊天污染助手上下文） */
+	storyId?: string;
+}
+
 export interface AssistantHost {
 	/** 发话（剧情/助手各自独立排队） */
 	prompt(text: string): Promise<void>;
+	/**
+	 * 剧情侧委托：跑到助手调用 return_answer（或放弃/兜底）为止。
+	 * 调用方负责 UI 上的 user 回显。
+	 */
+	runTask(text: string): Promise<AssistantReturnPayload>;
 	abort(): Promise<void>;
-	/** 开新对话（旧会话文件保留在 .liyuan-assistant/，不再续接） */
+	/** 开新对话（旧会话文件保留在 .liyuan-assistant/，不再续接；绑定当前角色卡） */
 	newConversation(): Promise<void>;
+	/** 按当前角色卡列出助手历史 */
+	listSessions(): Promise<AssistantSessionInfo[]>;
+	/** 打开助手会话文件（须属当前卡） */
+	openSession(path: string): Promise<void>;
+	/** 删除助手会话（不能删当前打开的） */
+	deleteSession(path: string): Promise<void>;
+	/** 换剧情卡后：切到该卡最近助手会话，没有则新建 */
+	switchToCard(): Promise<"switched" | "created">;
+	/**
+	 * 对齐当前剧情会话：有绑定该 storyId 的助手历史则打开，否则新建。
+	 * 新剧情聊天 / 切换剧情会话时调用，避免接着旧助手上下文。
+	 */
+	switchToStory(storyId: string): Promise<"switched" | "created" | "same">;
+	/** 当前会话文件路径 */
+	sessionPath(): string | undefined;
 	/** 选模型：null=回到跟随剧情模型；写入 config.assistantModel */
 	setModel(sel: AssistantModelSel | null): Promise<void>;
 	modelInfo(): { provider: string; id: string; name: string } | null;
@@ -147,8 +199,117 @@ const parseJsonObject = (raw: string): Record<string, unknown> | null => {
 
 // ---------- 助手工具面（白名单写 + 只读剧情面） ----------
 
-function createStagehandTools(cwd: string, bridge: StoryBridge): ToolDefinition[] {
+type AssistantUiSelect = (
+	title: string,
+	options: string[],
+	opts?: { signal?: AbortSignal },
+) => Promise<string | undefined>;
+
+interface StagehandToolHooks {
+	/** 是否处于剧情委托（assistant_run） */
+	isDelegating: () => boolean;
+	/** 交回剧情侧；返回 false 表示当前没有挂起的委托 */
+	settleReturn: (payload: AssistantReturnPayload) => boolean;
+	/** 选择卡（与剧情 ask 同源 UI） */
+	select: AssistantUiSelect;
+	/** 本委托回合已交付的媒体内容指纹（防 show_media + 自动捞路径重复） */
+	noteMediaDelivered: (contentKey: string) => void;
+	wasMediaDelivered: (contentKey: string) => boolean;
+	/** 文件内容指纹（与 /media/{key} 命名一致） */
+	mediaContentKey: (absPath: string) => string | null;
+}
+
+const ABANDON_OPTION = "放弃并返回";
+
+function ensureAbandonOption(options: string[]): string[] {
+	const list = options.map((o) => String(o ?? "").trim()).filter(Boolean);
+	const has = list.some((o) => /放弃|返回剧情|取消委托|abort|cancel/i.test(o));
+	if (!has) list.push(ABANDON_OPTION);
+	return list.slice(0, 6);
+}
+
+function isAbandonChoice(answer: string | undefined): boolean {
+	if (!answer) return true; // 用户点停止卡 = 放弃
+	return /放弃|返回剧情|取消委托|^取消$|abort|cancel/i.test(answer.trim());
+}
+
+function createStagehandTools(cwd: string, bridge: StoryBridge, hooks: StagehandToolHooks): ToolDefinition[] {
 	const tools: ToolDefinition[] = [];
+
+	// ---- 委托交回 / 卡住问人（先于其它工具注册，提示词与完成协议挂钩） ----
+	tools.push(
+		defineTool({
+			name: "return_answer",
+			label: "交回结果",
+			description:
+				"Hand the final result back to the story agent (or end a delegated task). Call when the task is done, failed with a clear reason, or the user chose to abandon. During a story-delegated turn this is REQUIRED—do not only write a chat reply. answer = concise summary for the story model (what was done, paths, errors).",
+			parameters: Type.Object({
+				answer: Type.String({ description: "交给剧情侧的结论摘要（成功结果 / 失败原因 / 已交付物说明）" }),
+				abandoned: Type.Optional(Type.Boolean({ description: "true = 用户放弃或主动收束，未完成目标" })),
+				ok: Type.Optional(Type.Boolean({ description: "false = 任务失败（默认 true，除非 abandoned）" })),
+			}),
+			async execute(_id, params) {
+				const abandoned = params.abandoned === true;
+				const ok = abandoned ? false : params.ok !== false;
+				const settled = hooks.settleReturn({
+					summary: params.answer.trim() || (abandoned ? "（已放弃）" : "（无摘要）"),
+					ok,
+					abandoned,
+					viaReturnTool: true,
+				});
+				if (!settled && !hooks.isDelegating()) {
+					// 右栏直聊：无挂起委托，把结论留在对话即可
+					return text(`已记录结论（当前非剧情委托）：${params.answer.trim()}`);
+				}
+				if (!settled) {
+					return text("交回信号已发出，但未找到挂起的委托（可能已超时收束）。", true);
+				}
+				return {
+					content: [
+						{
+							type: "text" as const,
+							text: abandoned ? "已放弃并交回剧情侧。" : "已将结果交回剧情侧。",
+						},
+					],
+					// 交回后本轮助手 loop 可结束，不必再生成长文
+					terminate: true,
+				};
+			},
+		}),
+		defineTool({
+			name: "ask_user",
+			label: "询问用户",
+			description:
+				"When stuck, missing info, or need a decision—show a choice card. Provide 2–4 concrete options; the system always ensures an abandon option exists. Do NOT silently stop on hard problems. If the user picks abandon, call return_answer with abandoned=true.",
+			parameters: Type.Object({
+				question: Type.String({ description: "要问用户的问题（说明卡点）" }),
+				options: Type.Array(Type.String(), {
+					description: "2～4 个选项；可含你建议的路径。系统会补上「放弃并返回」若你未写",
+				}),
+			}),
+			async execute(_id, params, signal) {
+				const options = ensureAbandonOption(Array.isArray(params.options) ? params.options : []);
+				if (options.length < 2) {
+					return text("至少需要 2 个选项（含放弃）。", true);
+				}
+				const answer = await hooks.select(params.question.trim() || "请选择", options, { signal });
+				if (isAbandonChoice(answer)) {
+					hooks.settleReturn({
+						summary: `用户选择放弃：${answer ?? "停止"}`,
+						ok: false,
+						abandoned: true,
+						viaReturnTool: true,
+					});
+					return {
+						content: [{ type: "text" as const, text: "用户选择放弃并返回。请再调 return_answer 确认交回（若尚未交回）。" }],
+						// 已 settle；仍提示模型可再 return_answer，但 terminate 避免空转
+						terminate: true,
+					};
+				}
+				return text(`用户选择：${answer}\n请据此继续；完成后调用 return_answer。`);
+			},
+		}),
+	);
 
 	tools.push(
 		defineTool({
@@ -348,7 +509,7 @@ function createStagehandTools(cwd: string, bridge: StoryBridge): ToolDefinition[
 			async execute(_id, params) {
 				const patch = parseJsonObject(params.patch);
 				if (!patch) return text("patch 不是合法的 JSON 对象", true);
-				const r = bridge.applyStatePatch(patch);
+				const r = await bridge.applyStatePatch(patch);
 				return text(
 					`账本已更新：${r.applied.join("；") || "（无变更）"}${r.warnings.length ? `\n警告：${r.warnings.join("；")}` : ""}`,
 				);
@@ -417,7 +578,7 @@ function createStagehandTools(cwd: string, bridge: StoryBridge): ToolDefinition[
 			name: "panel_write",
 			label: "写入面板",
 			description:
-				"Create or update a panel in the STORY UI (map, inventory, clue board, relationship chart…). Same name overwrites. For a spatial/layout map prefer kind='svg' (vector, annotatable, updatable step by step) over a raster image. This writes to the story session's panels and shows up in the story's side panel — it is NOT delivered into the chat transcript. kind: markdown | svg | html.",
+				"Create or update a panel in the STORY UI (map, inventory, clue board, relationship chart…). Same name overwrites. For a spatial/layout map prefer kind='svg' with viewBox (e.g. viewBox='0 0 400 300'); the side panel is narrow (~280–360px)—design content to fit, not a full desktop canvas. Prefer svg over a large raster image. Writes to the story session panels (same as the story agent), NOT into chat transcript. kind: markdown | svg | html.",
 			parameters: Type.Object({
 				name: Type.String({ description: "面板名（页签标题，同名覆盖）" }),
 				kind: Type.String({ description: `${PANEL_KINDS.join(" | ")}（地图/示意图用 svg，务必写 viewBox）` }),
@@ -427,18 +588,20 @@ function createStagehandTools(cwd: string, bridge: StoryBridge): ToolDefinition[
 				if (!PANEL_KINDS.includes(params.kind as (typeof PANEL_KINDS)[number])) {
 					return text(`kind 必须是 ${PANEL_KINDS.join(" / ")} 之一，收到「${params.kind}」`, true);
 				}
-				const r = bridge.writePanels([{ name: params.name, kind: params.kind, content: params.content }]);
+				const r = await bridge.writePanels([{ name: params.name, kind: params.kind, content: params.content }]);
 				if (r.imported === 0) {
 					return text(`面板写入失败：${r.errors.join("；") || "未知错误"}`, true);
 				}
-				return text(`面板「${params.name}」已写入剧情侧面板（${params.kind}），已在剧情界面显示。`);
+				return text(
+					`面板「${params.name}」已写入剧情侧（${params.kind}）并已同步；剧情继续时不会回档，无需用户再保存。`,
+				);
 			},
 		}),
 		defineTool({
 			name: "show_media",
 			label: "展示素材",
 			description:
-				"Deliver a LOCAL media file (image/audio/video you just generated) into THIS assistant conversation so the user can see/play it here. Use for one-off media the user asked the assistant to make. Note: this shows in the assistant panel, NOT in the story chat — putting media into the story transcript is the story agent's job (show_image). source = a local file path.",
+				"REQUIRED after you generate or download any image/audio/video to a local path. Copies into project media store (/media/…), shows it in the assistant panel, and when this turn is a story-delegated assistant_run ALSO pushes the same media into the main story chat. Never only write the file path in text or return_answer—users cannot see the file until you call this tool. source = absolute or project-relative local path (not http).",
 			parameters: Type.Object({
 				source: Type.String({ description: "本机媒体文件路径（.png/.jpg/.webp/.gif 或 .mp3/.wav 或 .mp4/.webm 等）" }),
 				caption: Type.Optional(Type.String({ description: "简短说明" })),
@@ -448,10 +611,30 @@ function createStagehandTools(cwd: string, bridge: StoryBridge): ToolDefinition[
 					return text("show_media 只接本机文件路径；http(s) 链接直接在回复里给出即可。", true);
 				}
 				const abs = isAbsolute(params.source) ? params.source : join(cwd, params.source);
+				const contentKey = hooks.mediaContentKey(abs);
+				// 同内容已交付过（本回合）：不重复入库/推送，只回报已有结果
+				if (contentKey && hooks.wasMediaDelivered(contentKey)) {
+					return text(`该媒体本回合已交付过（/media/${contentKey}…），无需重复 show_media。`);
+				}
 				const r = bridge.deliverMedia(abs);
 				if (!r.ok) return text(r.error, true);
+				if (contentKey) hooks.noteMediaDelivered(contentKey);
+				// 剧情委托中：同时推到中间对话流，避免「只在右栏、中间空白」
+				if (isAssistantDelegateActive() && bridge.emitStoryMedia) {
+					bridge.emitStoryMedia({
+						src: r.src,
+						kind: r.kind,
+						...(params.caption ? { caption: params.caption } : {}),
+					});
+				}
+				const dual = isAssistantDelegateActive() ? "；已同步到剧情对话与本地图片库" : "；已写入本地图片库（上传区可刷新查看）";
 				return {
-					content: [{ type: "text" as const, text: `已交付到助手对话（${r.kind}）：${params.caption ?? params.source}` }],
+					content: [
+						{
+							type: "text" as const,
+							text: `已交付（${r.kind}）：${r.src}${params.caption ? ` — ${params.caption}` : ""}${dual}`,
+						},
+					],
 					details: { asstMedia: { src: r.src, kind: r.kind, ...(params.caption ? { caption: params.caption } : {}) } },
 				};
 			},
@@ -605,6 +788,7 @@ function stagehandExtension(
 	cwd: string,
 	bridge: StoryBridge,
 	getSelf: () => { model: { provider: string; id: string } | null; follow: boolean },
+	isDelegating: () => boolean,
 ): ExtensionFactory {
 	return (pi) => {
 		let cache = "";
@@ -629,6 +813,7 @@ function stagehandExtension(
 					...bridge.snapshot(),
 					assistantModel: self.model,
 					assistantFollows: self.follow,
+					delegateActive: isDelegating(),
 				}),
 				display: false,
 				timestamp: Date.now(),
@@ -648,9 +833,265 @@ export async function createAssistantHost(opts: CreateAssistantHostOptions): Pro
 	let session: AgentSession;
 	let unsubscribe: (() => void) | undefined;
 
+	/** 剧情委托挂起：等 return_answer / 放弃 / 兜底 */
+	let pendingReturn: {
+		resolve: (p: AssistantReturnPayload) => void;
+		settled: boolean;
+	} | null = null;
+
+	const isDelegating = () => isAssistantDelegateActive();
+
+	/** 本委托回合已交付媒体内容指纹（show_media / 自动捞路径共用，防三连） */
+	let mediaDeliveredKeys = new Set<string>();
+
+	const mediaContentKey = (absPath: string): string | null => {
+		try {
+			if (!existsSync(absPath)) return null;
+			return createHash("md5").update(readFileSync(absPath)).digest("hex").slice(0, 16);
+		} catch {
+			return null;
+		}
+	};
+
+	/**
+	 * 模型常 curl 落盘后只写路径、忘调 show_media。
+	 * 交回时从摘要抓路径；**已 show_media 过的同内容跳过**（只补漏，不连推三次）。
+	 */
+	const autoDeliverHarvestedMedia = (blob: string): string[] => {
+		const delivered: string[] = [];
+		for (const p of harvestLocalMediaPaths(blob)) {
+			const abs = isAbsolute(p) ? p : join(cwd, p);
+			if (!existsSync(abs)) continue;
+			const key = mediaContentKey(abs);
+			if (key && mediaDeliveredKeys.has(key)) continue; // 本回合已交付
+			// 摘要里已有 /media/{key} 也视为已交付（模型写了路径）
+			if (key && new RegExp(`/media/${key}`, "i").test(blob)) {
+				mediaDeliveredKeys.add(key);
+				continue;
+			}
+			const r = bridge.deliverMedia(abs);
+			if (!r.ok) continue;
+			if (key) mediaDeliveredKeys.add(key);
+			const media = {
+				src: r.src,
+				kind: r.kind,
+				caption: `（自动交付）${p}`,
+			};
+			onEvent({
+				type: "message_end",
+				message: {
+					role: "toolResult",
+					toolName: "show_media",
+					isError: false,
+					details: { asstMedia: media },
+					content: [{ type: "text", text: `已自动交付：${r.src}` }],
+				},
+			} as never);
+			if (isDelegating() && bridge.emitStoryMedia) {
+				bridge.emitStoryMedia({
+					src: r.src,
+					kind: r.kind,
+					caption: media.caption,
+				});
+			}
+			delivered.push(r.src);
+		}
+		return delivered;
+	};
+
+	const settleReturn = (payload: AssistantReturnPayload): boolean => {
+		if (!pendingReturn || pendingReturn.settled) return false;
+		const harvestBlob = `${payload.summary}\n${extractLastAssistantText()}`;
+		const autoSrcs = autoDeliverHarvestedMedia(harvestBlob);
+		let summary = payload.summary;
+		if (autoSrcs.length) {
+			summary = `${summary}\n（系统已自动补交付漏掉的媒体：${autoSrcs.join("、")}）`;
+		}
+		pendingReturn.settled = true;
+		const resolve = pendingReturn.resolve;
+		pendingReturn = null;
+		resolve({ ...payload, summary });
+		return true;
+	};
+
+	const uiSelect: AssistantUiSelect = async (title, options, selectOpts) => {
+		const ui = uiContext as {
+			select?: (t: string, o: string[], opt?: { signal?: AbortSignal }) => Promise<string | undefined>;
+		};
+		if (typeof ui.select !== "function") return undefined;
+		return ui.select(title, options, selectOpts);
+	};
+
+	const toolHooks: StagehandToolHooks = {
+		isDelegating,
+		settleReturn,
+		select: uiSelect,
+		noteMediaDelivered: (k) => {
+			mediaDeliveredKeys.add(k);
+		},
+		wasMediaDelivered: (k) => mediaDeliveredKeys.has(k),
+		mediaContentKey,
+	};
+
 	const selfInfo = () => ({ model: modelInfo(), follow: follows() });
 
-	const build = async (fresh: boolean): Promise<AgentSession> => {
+	const currentCard = (): { path: string; name: string } => {
+		const config = loadConfig(cwd);
+		const path = (config.card ?? "").trim();
+		let name = bridge.cardName() || "角色";
+		if (path) {
+			try {
+				name = loadCardFile(isAbsolute(path) ? path : join(cwd, path)).name || name;
+			} catch {
+				// 坏卡路径：仍用 bridge 名
+			}
+		}
+		return { path, name };
+	};
+
+	/** 当前助手会话绑定的剧情 sessionId（来自最后一条 rp-card） */
+	const readCurrentStoryId = (s: AgentSession): string | undefined => {
+		try {
+			const entries = s.sessionManager.getEntries() as Array<{
+				type?: string;
+				customType?: string;
+				data?: { storyId?: string };
+			}>;
+			for (let i = entries.length - 1; i >= 0; i--) {
+				const e = entries[i];
+				if (e.type === "custom" && e.customType === "rp-card" && typeof e.data?.storyId === "string") {
+					const id = e.data.storyId.trim();
+					if (id) return id;
+				}
+			}
+		} catch {
+			// ignore
+		}
+		return undefined;
+	};
+
+	/**
+	 * 写入/刷新卡+剧情会话绑定。
+	 * - 无 rp-card：补写
+	 * - 有卡无 storyId 或 storyId 变了：再写一条最新绑定（parse 取最后一条）
+	 */
+	const ensureBind = (s: AgentSession, storyId?: string) => {
+		const { path: card, name } = currentCard();
+		if (!card) return;
+		try {
+			const entries = s.sessionManager.getEntries() as Array<{
+				type?: string;
+				customType?: string;
+				data?: { card?: string; storyId?: string };
+			}>;
+			const last = [...entries].reverse().find((e) => e.type === "custom" && e.customType === "rp-card");
+			const sid = (storyId ?? "").trim();
+			const need =
+				!last?.data?.card ||
+				(sid && last.data.storyId !== sid) ||
+				(card && last.data.card !== card);
+			if (need) {
+				s.sessionManager.appendCustomEntry("rp-card", {
+					card,
+					name,
+					...(sid ? { storyId: sid } : {}),
+				});
+			}
+		} catch {
+			// 极早期不可写：跳过
+		}
+	};
+
+	/** @deprecated 名称保留：无 story 时只钉卡 */
+	const ensureCardTag = (s: AgentSession) => ensureBind(s);
+
+	const readAsstCard = (
+		filePath: string,
+	): { card: string; name: string; storyId?: string } | null => {
+		try {
+			const size = statSync(filePath).size;
+			const fd = openSync(filePath, "r");
+			try {
+				const headLen = Math.min(size, 65536);
+				const headBuf = Buffer.alloc(headLen);
+				readSync(fd, headBuf, 0, headLen, 0);
+				let text = headBuf.toString("utf8");
+				if (size > 65536) {
+					const tailLen = Math.min(size - headLen, 65536);
+					const tailBuf = Buffer.alloc(tailLen);
+					readSync(fd, tailBuf, 0, tailLen, size - tailLen);
+					text += `\n${tailBuf.toString("utf8")}`;
+				}
+				return parseCardFromSessionHead(text);
+			} finally {
+				closeSync(fd);
+			}
+		} catch {
+			return null;
+		}
+	};
+
+	const readAsstPreview = (filePath: string): string => {
+		try {
+			const size = statSync(filePath).size;
+			const bytes = Math.min(size, 48_000);
+			const fd = openSync(filePath, "r");
+			try {
+				const buf = Buffer.alloc(bytes);
+				readSync(fd, buf, 0, bytes, Math.max(0, size - bytes));
+				const lines = buf.toString("utf8").split(/\r?\n/);
+				for (let i = lines.length - 1; i >= 0; i--) {
+					const line = lines[i].trim();
+					if (!line) continue;
+					try {
+						const e = JSON.parse(line) as {
+							type?: string;
+							message?: { role?: string; content?: unknown };
+							content?: unknown;
+							role?: string;
+						};
+						if (e.type === "message" && e.message?.role === "user") {
+							const c = e.message.content;
+							const t =
+								typeof c === "string"
+									? c
+									: Array.isArray(c)
+										? c
+												.map((p) =>
+													p && typeof p === "object" && (p as { type?: string }).type === "text"
+														? String((p as { text?: string }).text ?? "")
+														: "",
+												)
+												.join("")
+										: "";
+							const flat = t.replace(/\s+/g, " ").trim();
+							if (flat) return flat.slice(0, 80);
+						}
+					} catch {
+						// skip
+					}
+				}
+			} finally {
+				closeSync(fd);
+			}
+		} catch {
+			// ignore
+		}
+		return "";
+	};
+
+	const assertInSessionDir = (filePath: string) => {
+		const abs = resolve(filePath);
+		const root = resolve(sessionDir);
+		const n = (p: string) => normalize(p).replace(/\\/g, "/").toLowerCase().replace(/\/$/, "");
+		const na = n(abs);
+		const nr = n(root);
+		if (na !== nr && !na.startsWith(`${nr}/`)) throw new Error("非法助手会话路径");
+	};
+
+	type BuildMode = { kind: "new" } | { kind: "continue" } | { kind: "open"; path: string };
+
+	const build = async (mode: BuildMode): Promise<AgentSession> => {
 		const agentDir = getAgentDir();
 		const settingsManager = SettingsManager.create(cwd, agentDir);
 		const loader = new DefaultResourceLoader({
@@ -664,23 +1105,27 @@ export async function createAssistantHost(opts: CreateAssistantHostOptions): Pro
 			noPromptTemplates: true,
 			noThemes: true,
 			noContextFiles: true,
-			extensionFactories: [stagehandExtension(cwd, bridge, selfInfo)],
+			extensionFactories: [stagehandExtension(cwd, bridge, selfInfo, isDelegating)],
 		});
 		await loader.reload();
 
 		const config = loadConfig(cwd);
+		const sm =
+			mode.kind === "new"
+				? SessionManager.create(cwd, sessionDir)
+				: mode.kind === "open"
+					? SessionManager.open(mode.path, sessionDir, cwd)
+					: SessionManager.continueRecent(cwd, sessionDir);
 
 		const { session: s } = await createAgentSession({
 			cwd,
 			agentDir,
-			customTools: createStagehandTools(cwd, bridge),
+			customTools: createStagehandTools(cwd, bridge, toolHooks),
 			// backendControl 关 = 分发模式：助手也不给本机工具（read/bash/edit/write），只留领域工具
 			...(config.backendControl === false ? { noTools: "builtin" as const } : {}),
 			resourceLoader: loader,
 			settingsManager,
-			sessionManager: fresh
-				? SessionManager.create(cwd, sessionDir)
-				: SessionManager.continueRecent(cwd, sessionDir),
+			sessionManager: sm,
 		});
 
 		await s.bindExtensions({
@@ -694,6 +1139,11 @@ export async function createAssistantHost(opts: CreateAssistantHostOptions): Pro
 		// 显式助手模型：创建后手动应用（避免 setModel 改写共享默认模型设置）
 		if (config.assistantModel) {
 			applyModelTo(s, config.assistantModel, true);
+		}
+		try {
+			ensureBind(s, bridge.snapshot().sessionId);
+		} catch {
+			ensureCardTag(s);
 		}
 		return s;
 	};
@@ -749,15 +1199,90 @@ export async function createAssistantHost(opts: CreateAssistantHostOptions): Pro
 		applyModelTo(session, story, true);
 	};
 
-	session = await build(false);
+	session = await build({ kind: "continue" });
 	subscribe();
+
+	const extractLastAssistantText = (): string => {
+		const msgs = session.messages as Array<{ role?: string; content?: unknown }>;
+		for (let i = msgs.length - 1; i >= 0; i--) {
+			const m = msgs[i];
+			if (m.role !== "assistant") continue;
+			const c = m.content;
+			if (typeof c === "string") return c.trim();
+			if (Array.isArray(c)) {
+				const text = c
+					.filter((b): b is { type: string; text?: string } => !!b && typeof b === "object" && (b as { type?: string }).type === "text")
+					.map((b) => b.text ?? "")
+					.join("")
+					.trim();
+				if (text) return text;
+			}
+		}
+		return "";
+	};
 
 	return {
 		async prompt(t: string) {
 			syncFollowModel();
 			await session.prompt(t, session.isStreaming ? { streamingBehavior: "followUp" } : undefined);
 		},
+		async runTask(t: string) {
+			syncFollowModel();
+			// 已有挂起委托：不应重入
+			if (pendingReturn && !pendingReturn.settled) {
+				return {
+					summary: "上一次委托尚未交回，请先停止或等待。",
+					ok: false,
+					viaReturnTool: false,
+				};
+			}
+			// 委托前对齐剧情会话：新聊天不接着旧助手上下文
+			const storyId = bridge.snapshot().sessionId;
+			if (storyId) {
+				await this.switchToStory(storyId);
+			}
+			// 每轮委托清空媒体去重表
+			mediaDeliveredKeys = new Set();
+			const resultPromise = new Promise<AssistantReturnPayload>((resolve) => {
+				pendingReturn = { resolve, settled: false };
+			});
+			const softSettle = () => {
+				if (!pendingReturn || pendingReturn.settled) return;
+				const reply = extractLastAssistantText();
+				settleReturn({
+					summary: reply
+						? `${reply}\n（注：助手未调用 return_answer，以上为最后回复摘录。）`
+						: "助手结束但未调用 return_answer。",
+					ok: !!reply,
+					viaReturnTool: false,
+				});
+			};
+			try {
+				await session.prompt(t, session.isStreaming ? { streamingBehavior: "followUp" } : undefined);
+			} catch (err) {
+				if (!pendingReturn?.settled) {
+					settleReturn({
+						summary: `助手执行异常：${err instanceof Error ? err.message : String(err)}`,
+						ok: false,
+						viaReturnTool: false,
+					});
+				}
+				throw err;
+			} finally {
+				// agent loop 结束仍未 return_answer → 兜底交回，避免剧情侧永久等待
+				softSettle();
+			}
+			return resultPromise;
+		},
 		async abort() {
+			if (pendingReturn && !pendingReturn.settled) {
+				settleReturn({
+					summary: "用户停止了助手任务。",
+					ok: false,
+					abandoned: true,
+					viaReturnTool: false,
+				});
+			}
 			await session.abort();
 		},
 		async newConversation() {
@@ -768,9 +1293,152 @@ export async function createAssistantHost(opts: CreateAssistantHostOptions): Pro
 			}
 			unsubscribe?.();
 			session.dispose();
-			session = await build(true);
+			session = await build({ kind: "new" });
+			subscribe();
+			// 尽量钉上当前剧情会话（若 bridge 有快照）
+			try {
+				const sid = bridge.snapshot().sessionId;
+				if (sid) ensureBind(session, sid);
+			} catch {
+				ensureCardTag(session);
+			}
+		},
+		async listSessions() {
+			const { path: cardPath, name: cardName } = currentCard();
+			const all = await SessionManager.list(cwd, sessionDir);
+			const curFile = session.sessionFile;
+			const curId = session.sessionId;
+			const isSame = (a?: string, b?: string) => {
+				if (!a || !b) return false;
+				const n = (p: string) => normalize(p).replace(/\\/g, "/").toLowerCase();
+				return n(a) === n(b);
+			};
+			const out: AssistantSessionInfo[] = [];
+			for (const s of all) {
+				const mtime = s.modified instanceof Date ? s.modified.getTime() : Number(s.modified) || 0;
+				const info = readAsstCard(s.path);
+				const isCurrent = s.id === curId || isSame(s.path, curFile);
+				// 无卡标记：仅当前会话可显示（随后 ensureCardTag 会补）
+				if (!info) {
+					if (!isCurrent || !cardPath) continue;
+				} else if (!cardPath || !sameCardPath(info.card, cardPath, cwd)) {
+					continue;
+				}
+				const preview = readAsstPreview(s.path);
+				out.push({
+					path: s.path,
+					id: s.id,
+					...(s.name ? { name: s.name } : {}),
+					firstMessage: s.firstMessage,
+					modified: mtime,
+					messageCount: s.messageCount,
+					current: isCurrent,
+					...(preview ? { preview } : {}),
+					cardName: info?.name || cardName,
+					card: info?.card || cardPath,
+					...(info?.storyId ? { storyId: info.storyId } : {}),
+				});
+			}
+			// 当前会话未落盘时补一条
+			if (curId && !out.some((x) => x.current) && cardPath) {
+				out.unshift({
+					path: curFile || "",
+					id: curId,
+					firstMessage: "",
+					modified: Date.now(),
+					messageCount: (session.messages as unknown[]).length,
+					current: true,
+					cardName,
+					card: cardPath,
+					...(readCurrentStoryId(session) ? { storyId: readCurrentStoryId(session) } : {}),
+				});
+			}
+			out.sort((a, b) => b.modified - a.modified);
+			return out;
+		},
+		async openSession(path) {
+			if (session.isStreaming) throw new Error("请等助手当前回复完成（或先停止），再切换历史");
+			assertInSessionDir(path);
+			const { path: cardPath } = currentCard();
+			const info = readAsstCard(path);
+			if (info && cardPath && !sameCardPath(info.card, cardPath, cwd)) {
+				throw new Error("该助手会话属于其他角色卡");
+			}
+			const abs = resolve(path);
+			if (session.sessionFile && resolve(session.sessionFile) === abs) return;
+			try {
+				await session.abort();
+			} catch {
+				// ignore
+			}
+			unsubscribe?.();
+			session.dispose();
+			session = await build({ kind: "open", path: abs });
 			subscribe();
 		},
+		async deleteSession(path) {
+			if (session.isStreaming) throw new Error("请等助手当前回复完成（或先停止），再删除");
+			assertInSessionDir(path);
+			const abs = resolve(path);
+			if (session.sessionFile && resolve(session.sessionFile) === abs) {
+				throw new Error("不能删除当前打开的助手会话（先切到其他历史或新建）");
+			}
+			const { path: cardPath } = currentCard();
+			const info = readAsstCard(abs);
+			if (info && cardPath && !sameCardPath(info.card, cardPath, cwd)) {
+				throw new Error("该助手会话属于其他角色卡");
+			}
+			unlinkSync(abs);
+		},
+		async switchToCard() {
+			if (session.isStreaming) {
+				try {
+					await session.abort();
+				} catch {
+					// ignore
+				}
+			}
+			// 换卡后默认新开助手（不再误接同卡其它剧情的旧助手上下文）
+			await this.newConversation();
+			return "created";
+		},
+		async switchToStory(storyId) {
+			const sid = (storyId ?? "").trim();
+			if (!sid) {
+				await this.newConversation();
+				return "created";
+			}
+			if (session.isStreaming) {
+				try {
+					await session.abort();
+				} catch {
+					// ignore
+				}
+			}
+			// 已绑当前剧情会话 → 不动
+			if (readCurrentStoryId(session) === sid) {
+				ensureBind(session, sid);
+				return "same";
+			}
+			// 在同卡助手历史里找绑定该 storyId 的会话
+			const { path: cardPath } = currentCard();
+			const all = await SessionManager.list(cwd, sessionDir);
+			for (const s of all) {
+				const info = readAsstCard(s.path);
+				if (!info) continue;
+				if (cardPath && !sameCardPath(info.card, cardPath, cwd)) continue;
+				if (info.storyId === sid) {
+					await this.openSession(s.path);
+					ensureBind(session, sid);
+					return "switched";
+				}
+			}
+			// 没有 → 新建并钉绑定
+			await this.newConversation();
+			ensureBind(session, sid);
+			return "created";
+		},
+		sessionPath: () => session.sessionFile,
 		async setModel(sel) {
 			const config = loadConfig(cwd);
 			if (!sel) {

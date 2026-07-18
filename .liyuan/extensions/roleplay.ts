@@ -41,20 +41,30 @@ import {
 	setMountedLorebooks,
 	withAliases,
 } from "../../src/lorebook.ts";
-import { cleanAssistantText } from "../../src/postprocess.ts";
+import {
+	addFoldTags,
+	cleanAssistantText,
+	discoverFoldTagsFromTexts,
+	resetDisplayTagExtras,
+} from "../../src/postprocess.ts";
 import {
 	activePanels,
 	closePanel,
 	formatPanelIndex,
+	formatPanelSnapshot,
 	loadPanels,
 	PANEL_SOFT_LIMIT,
 	savePanels,
 	writePanel,
 	type PanelMap,
 } from "../../src/panels.ts";
+import { runAssistantTask } from "../../src/assistant-gateway.ts";
 import { enabledBlocks, normalizeRpPreset, type RpPreset } from "../../src/preset.ts";
+import { applyProjectedSamplers } from "../../src/samplers.ts";
+import { registerStoryPanelSync, registerStoryStateSync } from "../../src/story-sync.ts";
 import { formatPruneStats, pruneClosedTurns } from "../../src/retention.ts";
 import { buildLoreAliasPrompt, buildScribeTurnPrompt, parseLoreAliases, parseScribeResult } from "../../src/scribe.ts";
+import { shouldApplyStoryPreset } from "../../src/turn-intent.ts";
 import { listSkills } from "../../src/skills.ts";
 import { formatUploadIndex, listUploads } from "../../src/uploads.ts";
 import { isBackstageText } from "../../src/stance.ts";
@@ -120,6 +130,8 @@ const RP_TOOLS = [
 	"panel_write",
 	"panel_read",
 	"panel_close",
+	/** 系统/运维事务委托右栏助手（主入口合流） */
+	"assistant_run",
 ];
 
 /** 决策门禁工具（PLAN-PHASE4 柱 1）：仅 creationMode==="ask" 时进活跃集，停笔向用户询问剧情决策 */
@@ -138,13 +150,21 @@ export default function roleplayExtension(pi: ExtensionAPI) {
 	let config: RpConfig = { ...DEFAULT_CONFIG };
 	let card: CharacterCard | null = null;
 	let entries: LorebookEntry[] = [];
-	let systemPromptCache = "";
+	/** 剧情 system（含预设 system 块）；缺省与 ops 相同 */
+	let systemPromptStory = "";
+	/** 非剧情 system（不含预设块）——纯办事回合用 */
+	let systemPromptOps = "";
 	let state: WorldState = defaultState();
 	let stateFile = "";
 	// agent 自建面板（柱 2）：与 state 同一套「磁盘缓存 + 会话树快照」机制
 	let panels: PanelMap = {};
 	let panelsFile = "";
 	let preset: RpPreset | null = null;
+	/**
+	 * 本 agent 回合是否装配剧情预设（before_agent_start 按用户原文判定，context 复用）。
+	 * 预设 = 剧情生成专用；纯非剧情 false。
+	 */
+	let applyStoryPresetThisTurn = true;
 	/** 补充设定集文件（lorebook_write 的落点，按卡分文件） */
 	let overlayFile = "";
 	// 知识库（柱 3）：本会话挂载的库名与其归一化条目（独立于卡，.liyuan-codex/ 全局存在）
@@ -324,6 +344,42 @@ export default function roleplayExtension(pi: ExtensionAPI) {
 		if (panelsFile) savePanels(panelsFile, panels);
 		snapshotPanels();
 	};
+
+	/**
+	 * 从磁盘收编面板（助手 / REST / 面板坞改动后磁盘更新、扩展内存可能仍旧）。
+	 * 每轮 LLM 前调用，避免剧情侧 panel_write 用陈旧内存把右侧改动盖回档。
+	 * 亦注册给 server 写盘后直调（避免 /panelsync 走 prompt 队列死锁）。
+	 */
+	const syncPanelsFromDisk = () => {
+		if (!panelsFile) return;
+		try {
+			const disk = loadPanels(panelsFile);
+			if (JSON.stringify(disk) !== JSON.stringify(panels)) {
+				panels = disk;
+				snapshotPanels();
+			}
+		} catch {
+			// 盘不可读时保持内存
+		}
+	};
+
+	/** 同 syncPanelsFromDisk：世界状态经助手/面板编辑后，剧情侧须从盘对齐 */
+	const syncStateFromDisk = () => {
+		if (!stateFile) return;
+		try {
+			const disk = { ...defaultState(), ...loadState(stateFile) };
+			if (JSON.stringify(disk) !== JSON.stringify(state)) {
+				state = disk;
+				snapshotState();
+			}
+		} catch {
+			// 保持内存
+		}
+	};
+
+	// 供 server importPanels / applyStatePatch 直调（不经 slash 命令桥）
+	registerStoryPanelSync(syncPanelsFromDisk);
+	registerStoryStateSync(syncStateFromDisk);
 
 	/** 从当前剧情分支上最近的面板快照恢复；无快照返回 false */
 	const restorePanelsFromBranch = (sm: { getBranch: (fromId?: string) => unknown[] }): boolean => {
@@ -990,7 +1046,7 @@ export default function roleplayExtension(pi: ExtensionAPI) {
 			name: "panel_write",
 			label: "更新面板",
 			description:
-				"Create or update one of YOUR display panels — UI you own, shown beside the chat as a tab (map, inventory, clue board, relationship chart, custom tracker…). Invent panels as the story needs them; update a panel whenever its facts change. Same name = full replacement of content. kind: 'markdown' (lists/boards/tables), 'svg' (hand-drawn maps/diagrams — include a viewBox), 'html' (rich layout). STATIC content only: scripts and external resources are blocked by the sandbox. Panels hold meta-information for the user's eyes — NEVER narrative prose.",
+				"Create or update one of YOUR display panels — UI you own, shown beside the chat as a tab (map, inventory, clue board, relationship chart, custom tracker…). Invent panels as the story needs them; update a panel whenever its facts change. Same name = full replacement of content. kind: 'markdown' (lists/boards/tables), 'svg' (hand-drawn maps/diagrams — MUST include viewBox e.g. viewBox='0 0 400 300'; keep shapes inside; side panel is narrow ~280–360px, design for that width), 'html' (rich layout; use max-width:100% on images). STATIC content only: scripts and external resources are blocked by the sandbox. Panels hold meta-information for the user's eyes — NEVER narrative prose.",
 			parameters: Type.Object({
 				name: Type.String({ description: "Stable panel name, shown as the tab title, e.g. '地图'、'装备库'" }),
 				kind: Type.Union([Type.Literal("markdown"), Type.Literal("svg"), Type.Literal("html")], {
@@ -1065,6 +1121,61 @@ export default function roleplayExtension(pi: ExtensionAPI) {
 				panels = r.panels;
 				persistPanels();
 				return { content: [{ type: "text", text: `面板「${params.name.trim()}」已收起（内容保留，同名 panel_write 可重开）。` }] };
+			},
+		});
+
+		// 系统事务委托：右栏助手作为剧情 agent 的工具（主框统一入口，语义判断而非 // 硬改道）
+		pi.registerTool({
+			name: "assistant_run",
+			label: "委托助手",
+			description:
+				"Delegate a SYSTEM / ops / authoring task to the side Assistant (right panel). Use when the user wants APIs, image generation via external services, config/preset/model changes, diagnostics, skill notes, or other non-narrative work. Do NOT use for in-story creation (new character personality, scene direction, dialogue, IC choices)—handle those yourself with roleplay or ask_director. Pass a clear task description (user intent + needed context). Parentheses or // in user text are NOT a routing signal—judge by meaning. After a pure ops task, prefer ending the turn once the tool returns (set continue_story only if the user also asked to advance the scene).",
+			parameters: Type.Object({
+				task: Type.String({
+					description: "What the assistant should do, in plain language (include user intent and any paths/API names).",
+				}),
+				mode: Type.Optional(
+					Type.Union([Type.Literal("ops"), Type.Literal("author"), Type.Literal("diagnose"), Type.Literal("auto")], {
+						description: "ops=API/media/bash; author=panels/lore/state; diagnose=debug config; auto=default",
+					}),
+				),
+				continue_story: Type.Optional(
+					Type.Boolean({
+						description:
+							"true = you still need another narrative generation after the assistant finishes (mixed request). false/omit = this turn can end after the tool (pure ops).",
+					}),
+				),
+			}),
+			async execute(_id, params, signal) {
+				const r = await runAssistantTask({
+					task: params.task,
+					mode: params.mode ?? "auto",
+					signal,
+				});
+				const continueStory = params.continue_story === true;
+				const head = r.abandoned
+					? "助手委托已放弃。"
+					: r.ok
+						? r.viaReturnTool
+							? "助手已正式交回结果。"
+							: "助手回合结束（未走 return_answer，以下为摘录）。"
+						: "助手委托未成功。";
+				const hint = continueStory
+					? "（你要求继续剧情：可根据结果续写。）"
+					: "（纯系统事务：结果已交回；本轮可结束。）";
+				return {
+					content: [{ type: "text", text: `${head}\n${r.summary}\n${hint}` }],
+					details: {
+						assistantRun: {
+							ok: r.ok,
+							abandoned: r.abandoned,
+							viaReturnTool: r.viaReturnTool,
+							continueStory,
+						},
+					},
+					// 纯办事：terminate → 不再强制第二轮 LLM
+					...(continueStory || (!r.ok && !r.abandoned) ? {} : { terminate: true }),
+				};
 			},
 		});
 
@@ -1193,16 +1304,8 @@ export default function roleplayExtension(pi: ExtensionAPI) {
 				mcpIndexCache = "（MCP 同步失败。）";
 			}
 
-			systemPromptCache = buildSystemPrompt({
-				card,
-				config,
-				constantLore: constantEntries(entries),
-				presetSystemBlocks: preset ? enabledBlocks(preset, "system") : undefined,
-				// Web 宿主注入自身接口地址（TUI 下缺省）；会话内不变，D8 字节稳定
-				// 技能库索引（§6.4）：session_start 装载，会话内字节稳定
-				skills: listSkills(ctx.cwd),
-				mcpIndex: mcpIndexCache,
-			});
+			// 双 system：剧情含预设 system 块；非剧情不含——会话内各自字节稳定（D8）
+			rebuildSystemPrompts(ctx.cwd);
 
 			if (rpMode) {
 				savedTools = pi.getActiveTools();
@@ -1211,7 +1314,8 @@ export default function roleplayExtension(pi: ExtensionAPI) {
 
 			// 会话-卡绑定（PLAN-PHASE3 §2.1）：会话文件声明属于哪张卡。
 			// - 无标记 → 写入当前卡
-			// - 已有标记但路径≠当前 config.card（换卡后仍续着旧会话）→ 再写一条新标记（解析取最后一条）
+			// - 已有标记：保留原绑定，绝不在 session_start 重写为当前卡
+			//   （否则「打开一次旧卡会话」会把该会话偷到新卡名下，历史串卡）
 			try {
 				const cardEntries = ctx.sessionManager
 					.getEntries()
@@ -1222,11 +1326,13 @@ export default function roleplayExtension(pi: ExtensionAPI) {
 				}>;
 				const last = cardEntries[cardEntries.length - 1];
 				const bound = last?.data?.card;
-				if (!bound || bound !== config.card) {
+				if (!bound) {
 					pi.appendEntry("rp-card", { card: config.card, name: card.name });
 					if (process.env.RP_DEBUG) {
-						console.error(`[rp-card] ${bound ? "换卡后更新" : "补写"}卡标记：${card.name} ← ${config.card}`);
+						console.error(`[rp-card] 补写卡标记：${card.name} ← ${config.card}`);
 					}
+				} else if (bound !== config.card && process.env.RP_DEBUG) {
+					console.error(`[rp-card] 会话已绑定「${bound}」，当前卡「${config.card}」——不重写（防串卡）`);
 				}
 			} catch (err) {
 				// 会话不可写的极早期生命周期：跳过，不影响游玩
@@ -1252,21 +1358,64 @@ export default function roleplayExtension(pi: ExtensionAPI) {
 			if (process.env.RP_DEBUG) {
 				console.error(`[rp-debug] session_start 装载失败：`, err);
 			}
-			systemPromptCache = `你在进行角色扮演，但素材装载失败（${err instanceof Error ? err.message : String(err)}）。请向用户说明该错误。`;
+			systemPromptStory = `你在进行角色扮演，但素材装载失败（${err instanceof Error ? err.message : String(err)}）。请向用户说明该错误。`;
+			systemPromptOps = systemPromptStory;
 			notify(ctx, `RP 素材装载失败：${err instanceof Error ? err.message : String(err)}`, "error");
 		}
 	});
 
-	pi.on("before_agent_start", async () => {
-		if (rpMode && systemPromptCache) {
-			return { systemPrompt: systemPromptCache };
+	/** 从当前预设扫描「应折叠」标签写入 postprocess（换预设即重扫） */
+	const refreshDisplayTagExtras = () => {
+		resetDisplayTagExtras();
+		if (!preset) return;
+		const texts = preset.blocks.filter((b) => b.enabled).map((b) => b.content);
+		const discovered = discoverFoldTagsFromTexts(texts);
+		if (discovered.length) addFoldTags(discovered);
+		if (process.env.RP_DEBUG && discovered.length) {
+			console.error(`[rp-tags] 预设折叠标签：${discovered.join(", ")}`);
 		}
-		return undefined;
+	};
+
+	/** 重装剧情/非剧情两套 system（预设 system 块只进 story） */
+	const rebuildSystemPrompts = (cwd: string) => {
+		if (!card) return;
+		refreshDisplayTagExtras();
+		const base = {
+			card,
+			config,
+			constantLore: constantEntries(entries),
+			skills: listSkills(cwd),
+			mcpIndex: mcpIndexCache,
+		};
+		systemPromptOps = buildSystemPrompt({ ...base, presetSystemBlocks: undefined });
+		systemPromptStory = buildSystemPrompt({
+			...base,
+			presetSystemBlocks: preset ? enabledBlocks(preset, "system") : undefined,
+		});
+	};
+
+	pi.on("before_agent_start", async (event) => {
+		// 助手/REST 可能已改磁盘；进剧情回合前先对齐，避免回档
+		if (rpMode) {
+			syncPanelsFromDisk();
+			syncStateFromDisk();
+		}
+		if (!rpMode) return undefined;
+		// 预设只服务剧情生成：按本轮用户原文判定，整段 agent 循环（含 tool 轮）沿用
+		const prompt = typeof event?.prompt === "string" ? event.prompt : "";
+		applyStoryPresetThisTurn = shouldApplyStoryPreset(prompt);
+		const sp = applyStoryPresetThisTurn ? systemPromptStory : systemPromptOps;
+		if (!sp) return undefined;
+		return { systemPrompt: sp };
 	});
 
 	// 每轮 LLM 调用前：D9 减法裁剪 → 清理助手历史文本 → 末端注入世界状态与触发设定
 	pi.on("context", async (event, ctx) => {
 		if (!rpMode || !card) return undefined;
+
+		// 工具轮之间也会再进 context：助手在本轮 assistant_run 里改的面板/账本必须立刻可见
+		syncPanelsFromDisk();
+		syncStateFromDisk();
 
 		// 世界书中文别名懒初始化（首次会话一次旁侧调用，此后走磁盘缓存）
 		await ensureAliases(ctx);
@@ -1342,6 +1491,8 @@ export default function roleplayExtension(pi: ExtensionAPI) {
 		const lastUserText = lastUser ? extractText(lastUser) : "";
 		const legacyBackstage = !!lastUserText && isBackstageText(lastUserText);
 
+		// 工具轮 context 复用 before_agent_start 的判定；若本轮尚未跑过 start（极少），再按 last user 估一次
+		const applyPreset = applyStoryPresetThisTurn;
 		messages.push({
 			role: "custom",
 			customType: "rp-inject",
@@ -1351,8 +1502,12 @@ export default function roleplayExtension(pi: ExtensionAPI) {
 				card,
 				config,
 				languageMismatch,
-				presetPostHistoryBlocks: preset ? enabledBlocks(preset, "postHistory") : undefined,
-				panelIndex: formatPanelIndex(panels) ?? undefined,
+				applyStoryPreset: applyPreset,
+				// 剧情预设 postHistory（字数/思维链等）仅剧情回合注入
+				presetPostHistoryBlocks:
+					applyPreset && preset ? enabledBlocks(preset, "postHistory") : undefined,
+				// 全文快照（sync 之后）：用户手改后模型续写可见；超长截断仍可用 panel_read
+				panelIndex: formatPanelSnapshot(panels) ?? formatPanelIndex(panels) ?? undefined,
 				codexIndex: codexIndexCache ?? undefined,
 				uploadIndex: formatUploadIndex(listUploads(appCwd)) ?? undefined,
 				userText: legacyBackstage ? undefined : lastUserText,
@@ -1364,18 +1519,35 @@ export default function roleplayExtension(pi: ExtensionAPI) {
 		return { messages };
 	});
 
-	// 预设采样参数：直接改写 provider 请求体（OpenAI 兼容键，原样搬运）
-	pi.on("before_provider_request", async (event) => {
+	// 预设采样参数：UI/预设常驻全套，发送时按渠道投影（对齐 ST openai.js generate_data）。
+	// 默认自定义中转只发核心 4 键，避免 top_k/repetition_penalty 打挂 Kimi 等严校验源。
+	pi.on("before_provider_request", async (event, ctx) => {
 		if (!rpMode || !preset || Object.keys(preset.samplers).length === 0) return undefined;
 		const payload = event.payload;
 		if (!payload || typeof payload !== "object" || Array.isArray(payload)) return undefined;
-		return { ...(payload as Record<string, unknown>), ...preset.samplers };
+		const model = ctx.model;
+		return applyProjectedSamplers(payload as Record<string, unknown>, preset.samplers, {
+			provider: model?.provider,
+			modelId: model?.id,
+			baseUrl: model?.baseUrl,
+			api: typeof model?.api === "string" ? model.api : undefined,
+		});
 	});
 
 	// 场记记账（每用户轮结束后一次旁侧调用；只写状态补丁，不做连续性/先斩后奏审查）
-	pi.on("agent_end", async (event, ctx) => {
+	// 注意：不 await 长调用——agent_end 监听器会卡住 waitForIdle / 停止按钮收尾。
+	pi.on("agent_end", (event, ctx) => {
 		if (!rpMode || !card || scribeBusy) return;
-		const msgs = event.messages as Array<{ role?: string; content?: unknown; customType?: string }>;
+		const msgs = event.messages as Array<{
+			role?: string;
+			content?: unknown;
+			customType?: string;
+			stopReason?: string;
+		}>;
+		// 用户强制停止的回合：不记账（半截正文、中止噪声）
+		const lastAsst = [...msgs].reverse().find((m) => m.role === "assistant");
+		if (lastAsst?.stopReason === "aborted") return;
+
 		let lastUserIdx = -1;
 		for (let i = msgs.length - 1; i >= 0; i--) {
 			if (msgs[i].role === "user") {
@@ -1396,39 +1568,41 @@ export default function roleplayExtension(pi: ExtensionAPI) {
 		if (!assistantText.trim()) return;
 
 		scribeBusy = true;
-		try {
-			const prompt = buildScribeTurnPrompt({
-				state,
-				userText,
-				assistantText,
-				charName: card.name,
-				userName: config.userName,
-			});
-			// 只抽 patch，输出短，token 上限收紧
-			const text = await sideComplete(ctx, prompt.systemPrompt, prompt.userText, 1024);
-			if (!text) return;
-			const result = parseScribeResult(text);
-			if (!result) {
-				if (process.env.RP_DEBUG) console.error(`[rp-scribe] 输出不可解析，本轮跳过`);
-				return;
-			}
-			if (Object.keys(result.patch).length > 0) {
-				const knownNames = [card.name, config.userName, ...Object.keys(state.characters)];
-				const applied = applyPatch(state, canonicalizeCharacterKeys(result.patch, knownNames));
-				state = applied.state;
-				if (stateFile) saveState(stateFile, state);
-				snapshotState();
-				if (process.env.RP_DEBUG) {
-					console.error(`[rp-scribe] ${applied.applied.join("；") || "（无变更）"}`);
+		void (async () => {
+			try {
+				const prompt = buildScribeTurnPrompt({
+					state,
+					userText,
+					assistantText,
+					charName: card.name,
+					userName: config.userName,
+				});
+				// 只抽 patch，输出短，token 上限收紧
+				const text = await sideComplete(ctx, prompt.systemPrompt, prompt.userText, 1024);
+				if (!text) return;
+				const result = parseScribeResult(text);
+				if (!result) {
+					if (process.env.RP_DEBUG) console.error(`[rp-scribe] 输出不可解析，本轮跳过`);
+					return;
 				}
+				if (Object.keys(result.patch).length > 0) {
+					const knownNames = [card.name, config.userName, ...Object.keys(state.characters)];
+					const applied = applyPatch(state, canonicalizeCharacterKeys(result.patch, knownNames));
+					state = applied.state;
+					if (stateFile) saveState(stateFile, state);
+					snapshotState();
+					if (process.env.RP_DEBUG) {
+						console.error(`[rp-scribe] ${applied.applied.join("；") || "（无变更）"}`);
+					}
+				}
+			} catch (err) {
+				if (process.env.RP_DEBUG) {
+					console.error(`[rp-scribe] 失败（本轮跳过）：${err instanceof Error ? err.message : String(err)}`);
+				}
+			} finally {
+				scribeBusy = false;
 			}
-		} catch (err) {
-			if (process.env.RP_DEBUG) {
-				console.error(`[rp-scribe] 失败（本轮跳过）：${err instanceof Error ? err.message : String(err)}`);
-			}
-		} finally {
-			scribeBusy = false;
-		}
+		})();
 	});
 
 	// 剧情向压缩接管：用场记提示词替代 pi 默认的 coding 摘要模板
@@ -1964,16 +2138,7 @@ export default function roleplayExtension(pi: ExtensionAPI) {
 			try {
 				await syncMcp(next);
 				// 开关后就地重装 system prompt 索引（同会话内 MCP 段可变；其余仍稳定）
-				if (card) {
-					systemPromptCache = buildSystemPrompt({
-						card,
-						config,
-						constantLore: constantEntries(entries),
-						presetSystemBlocks: preset ? enabledBlocks(preset, "system") : undefined,
-						skills: listSkills(appCwd),
-						mcpIndex: mcpIndexCache,
-					});
-				}
+				if (card) rebuildSystemPrompts(appCwd);
 				notify(ctx, on ? `本对话已启用 MCP「${id}」（工具 ${mcpToolNames.length}）` : `本对话已关闭 MCP「${id}」`);
 			} catch (err) {
 				notify(ctx, `MCP 切换失败：${err instanceof Error ? err.message : String(err)}`, "error");
@@ -2018,14 +2183,7 @@ export default function roleplayExtension(pi: ExtensionAPI) {
 				preset = normalizeRpPreset(JSON.parse(readFileSync(presetPath, "utf8")));
 			}
 		}
-		systemPromptCache = buildSystemPrompt({
-			card,
-			config,
-			constantLore: constantEntries(entries),
-			presetSystemBlocks: preset ? enabledBlocks(preset, "system") : undefined,
-			skills: listSkills(cwd),
-			mcpIndex: mcpIndexCache,
-		});
+		rebuildSystemPrompts(cwd);
 		if (rpMode) applyRpToolset();
 	};
 

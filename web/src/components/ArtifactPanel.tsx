@@ -1,16 +1,15 @@
 /**
- * Agent 自建面板渲染（PLAN-PHASE4 柱 2）。
+ * Agent 自建面板渲染（PLAN-PHASE4 柱 2）+ 用户源码编辑（方案 A）。
  *
  * 沙箱纪律（2026-07-10 用户定调：静态锁死）：
- * - markdown：本地 React 渲染——纯文本变换、零 innerHTML，天然无注入面；
- *   原文里的 HTML 一律按字面文本呈现。
- * - svg / html：iframe sandbox=""（无脚本、无同源、无导航）+ 文档内
- *   CSP default-src 'none' 双保险——sandbox 拦脚本执行，CSP 拦外链资源加载。
- *   卡片素材里的注入指令即使骗过 agent，也写不出能作恶的面板。
+ * - markdown：本地 React 渲染——纯文本变换、零 innerHTML；
+ * - svg / html：iframe sandbox="" + CSP；
+ * - 编辑态：改 content 源码（全 kind 通用），不提供字段级固定 UI。
  */
 
-import type { ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 
+import { apiPut } from "../api.ts";
 import type { RpPanel } from "../wire.ts";
 
 /** srcdoc 文档头：CSP 锁死一切外部加载（只留内联样式），加一段与主题同调的基础排版 */
@@ -25,19 +24,143 @@ const FRAME_HEAD =
 	`img{display:none}` + // CSP 已拦外链图；彻底不显示避免碎图标
 	`</style>`;
 
-export function ArtifactPanel({ panel }: { panel: RpPanel }) {
-	if (panel.kind === "markdown") {
-		return <div className="panel-body artifact-md">{renderMarkdown(panel.content)}</div>;
-	}
-	// svg / html：统一走全锁沙箱 iframe
+const KINDS = ["markdown", "svg", "html"] as const;
+type PanelKind = (typeof KINDS)[number];
+
+export function ArtifactPanel({
+	panel,
+	onSaved,
+}: {
+	panel: RpPanel;
+	/** 保存成功后可选回调（父级可乐观更新；通常靠 WS panels 帧即可） */
+	onSaved?: (p: { name: string; kind: string; content: string; updatedAt: number }) => void;
+}) {
+	const [editing, setEditing] = useState(false);
+	const [draft, setDraft] = useState(panel.content);
+	const [kind, setKind] = useState<PanelKind>(
+		KINDS.includes(panel.kind as PanelKind) ? (panel.kind as PanelKind) : "markdown",
+	);
+	const [saving, setSaving] = useState(false);
+	const [err, setErr] = useState<string | null>(null);
+
+	// 外部 panels 帧更新时：非编辑态跟盘；编辑态不抢草稿
+	useEffect(() => {
+		if (editing) return;
+		setDraft(panel.content);
+		setKind(KINDS.includes(panel.kind as PanelKind) ? (panel.kind as PanelKind) : "markdown");
+		setErr(null);
+	}, [panel.name, panel.content, panel.kind, panel.updatedAt, editing]);
+
+	const startEdit = () => {
+		setDraft(panel.content);
+		setKind(KINDS.includes(panel.kind as PanelKind) ? (panel.kind as PanelKind) : "markdown");
+		setErr(null);
+		setEditing(true);
+	};
+
+	const cancel = () => {
+		setDraft(panel.content);
+		setKind(KINDS.includes(panel.kind as PanelKind) ? (panel.kind as PanelKind) : "markdown");
+		setErr(null);
+		setEditing(false);
+	};
+
+	const save = async () => {
+		if (saving) return;
+		setSaving(true);
+		setErr(null);
+		try {
+			const r = await apiPut<{ ok: boolean; name: string; kind: string; updatedAt: number }>("/api/panels", {
+				name: panel.name,
+				content: draft,
+				kind,
+			});
+			setEditing(false);
+			onSaved?.({ name: r.name, kind: r.kind, content: draft, updatedAt: r.updatedAt });
+		} catch (e) {
+			setErr(e instanceof Error ? e.message : String(e));
+		} finally {
+			setSaving(false);
+		}
+	};
+
+	const dirty = editing && (draft !== panel.content || kind !== panel.kind);
+
 	return (
-		<div className="panel-body artifact-frame-wrap">
-			<iframe
-				className="artifact-frame"
-				title={panel.name}
-				sandbox=""
-				srcDoc={`<!doctype html><html><head>${FRAME_HEAD}</head><body>${panel.content}</body></html>`}
-			/>
+		<div className="artifact-root">
+			<div className="artifact-toolbar">
+				<span className="artifact-kind-chip" title="面板类型">
+					{editing ? (
+						<select
+							className="artifact-kind-select"
+							value={kind}
+							onChange={(e) => setKind(e.target.value as PanelKind)}
+							aria-label="面板类型"
+						>
+							{KINDS.map((k) => (
+								<option key={k} value={k}>
+									{k}
+								</option>
+							))}
+						</select>
+					) : (
+						panel.kind
+					)}
+				</span>
+				<span className="artifact-toolbar-hint">
+					{editing ? "编辑源码 · 保存后 agent 下轮可见" : "agent 维护 · 可手改"}
+				</span>
+				<span className="artifact-toolbar-actions">
+					{editing ? (
+						<>
+							<button type="button" className="drawer-btn" disabled={saving} onClick={cancel}>
+								取消
+							</button>
+							<button
+								type="button"
+								className="drawer-btn save-btn"
+								disabled={saving || !draft.trim()}
+								onClick={() => void save()}
+								title={dirty ? "保存修改" : "内容未改，仍可保存刷新时间"}
+							>
+								{saving ? "保存中…" : "保存"}
+							</button>
+						</>
+					) : (
+						<button type="button" className="drawer-btn" onClick={startEdit}>
+							编辑
+						</button>
+					)}
+				</span>
+			</div>
+			{err && <div className="artifact-err">{err}</div>}
+			{editing ? (
+				<textarea
+					className="artifact-editor"
+					value={draft}
+					onChange={(e) => setDraft(e.target.value)}
+					spellCheck={false}
+					aria-label={`编辑面板 ${panel.name}`}
+					placeholder={
+						kind === "markdown"
+							? "Markdown 正文…"
+							: kind === "svg"
+								? "<svg viewBox=\"0 0 …\">…</svg>"
+								: "HTML 片段…"
+					}
+				/>
+			) : panel.kind === "markdown" ? (
+				<div className="panel-body artifact-md">{renderMarkdown(panel.content)}</div>
+			) : (
+				<div className="panel-body artifact-frame-wrap">
+					<iframe
+						className="artifact-frame"
+						title={panel.name}
+						sandbox=""
+						srcDoc={`<!doctype html><html><head>${FRAME_HEAD}</head><body>${panel.content}</body></html>`}
+					/>
+				</div>
+			)}
 		</div>
 	);
 }

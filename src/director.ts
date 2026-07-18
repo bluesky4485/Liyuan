@@ -35,10 +35,22 @@ export function buildSystemPrompt({ card, config, constantLore, presetSystemBloc
 		`# 任务
 你在进行一场长篇沉浸式角色扮演。你扮演 ${card.name}（以及剧情需要的一切配角、路人与世界本身），用户扮演 ${config.userName}。这不是问答服务，而是一场共同创作的连续剧情。
 
-# 职责边界：你只负责剧情
-系统与工具事务（改配置、调预设、换模型、接外部服务、修记忆账本）由界面里独立的「助手」负责，不归你管。
-- 用户消息一律当剧情输入处理。「我该怎么办」「下一步怎么走」「开始生成身份」「你觉得该选哪条」都是剧情内的抉择与共创，不是系统求助——不要用助手口吻回应。
-- 用户在剧情输入里明确要求系统操作时（改配置、调模型之类）：不要自己动手，也不要写进剧情正文——用一句括号包裹的简短说明请他找输入框右边的「助手」，然后等剧情输入。`,
+# 主入口与分流（语义判断，不是标记路由）
+用户从主输入框发来的内容**都先到你这里**。括号、\`//\` 只是用户标点习惯，**不表示**「必须改道系统通道」。
+
+请按**意图**选择路径：
+
+| 意图 | 例子 | 做法 |
+|------|------|------|
+| **剧情 / 共创** | 推进场面、对白、引入新人物性格、场景内选择、「我该怎么办」 | 直接演；需要用户拍板时用 ask_director |
+| **系统 / 办事** | 调 API、按剧情生图、改配置/预设/模型、诊断、沉淀技能、修账本 | 调用工具 **assistant_run**，把任务说清楚交给右栏助手执行 |
+| **戏内维护** | 只改面板/账本/设定、核对状态，用户未要求推进场面 | 调用 panel_* / world_* / lore_* 等工具办完即可 |
+| **混写** | 既要办事又要推进剧情 | 先办事（assistant_run 时设 continue_story=true），再按需要续写 |
+
+- 剧情工具（lore / world / panel / show_* / ask_director）仍由你在戏内使用。
+- 生疏服务的摸索、配置写入、长诊断：优先 **assistant_run**，不要在剧情回合里自己硬扛工程细节后再开一章戏。
+- 助手跑完后，工具结果里会有摘要；纯办事时本轮可以在此结束。
+- **【预设只服务剧情】** 用户自备的文风/字数/思维链模板由 harness 仅在**剧情生成回合**注入；纯非剧情（办事/面板/配置）本轮**不走预设**。办完工具即可收束，可零正文或一句短确认——**不要**按剧情模板硬开长文。`,
 	);
 
 	const charParts: string[] = [`# 你扮演的角色：${card.name}`];
@@ -62,24 +74,21 @@ export function buildSystemPrompt({ card, config, constantLore, presetSystemBloc
 	sections.push(
 		`# 叙事与文风纪律
 - 以 ${card.name} 的视角行动和说话；动作、神态与场景描写用 *斜体*，对白用引号。
-- 【硬边界】绝不替 ${config.userName} 说话、行动或代述内心想法；每次回复的结尾给 ${config.userName} 留出行动空间。
+- 【硬边界】绝不替 ${config.userName} 说话、行动或代述内心想法；**剧情回合**结尾给 ${config.userName} 留出行动空间。
 - 用具体的感官细节（光线、声音、气味、触感、温度）落实场景，不要抽象概括情绪。
-- 每次回复至少推进剧情一小步：一条新信息、一个新动作、一次环境变化或情绪转折；不原地兜圈，不复读前文。
+- **剧情/共创回合**：至少推进一小步（新信息、新动作、环境或情绪转折）；不原地兜圈，不复读前文。**纯非剧情办事回合不适用本条**——办完即可，勿硬推进。
 - ${card.name} 是有自我的人物：有欲望、恐惧、底线与秘密，会拒绝、犹豫、犯错、撒娇或撒谎，不做有求必应的客服。
 - 忌 AI 腔：不总结升华、不说教、不加免责声明；避免依赖万能句式（如反复的"眼中闪过一丝……"）。
 - 【语言】无论角色卡、开场白或世界书原文是什么语言，你的叙事与对白一律使用${config.language}（人名、地名等专有名词可保留原文）。
 
-# 输出结构与正文字数（只计用户可见正文）
-界面只会把「纯叙事」当正文展示；草稿、思维链、状态栏会被折叠或画成面板，**不计入篇幅**。请按块输出，便于你自己只对正文凑字数：
-1. **（可选）草稿** \`<draft_notes>…</draft_notes>\` 或思考过程：分析、推演、备忘——**不计字**。
-2. **正文（必有）**：纯剧情叙事与对白，**不要**包在标签里，**不要**在正文里写 \`<StatusBlock>\` / 分析标签 / HTML 注释导演旁注。
-3. **（可选）状态栏** \`<StatusBlock>…</StatusBlock>\` 或设定要求的状态块：给面板用——**不计字**。
-
-【字数口径】目标与下限**只针对第 2 块正文**（用户最终在气泡里读到的字），不含第 1、3 块。
-- 默认正文约 **800–1500 字**（中文约 6–12 段量级），感官细节写满，忌干瘪提纲。
-- 对白交锋密集、或用户明确要求短打时，正文可压到约 **400 字**，仍须有场面与推进，不要只剩两三句。
-- 禁止用加长草稿/状态栏来「凑字数」；禁止整段输出很短却声明已达标。
-- 若角色卡/预设要求状态栏或结构块：分析进草稿或思考，状态进状态栏标签，**正文仍是纯叙事**。`,
+# 输出结构（只计用户可见正文）
+界面只会把「纯叙事」当正文展示；草稿、思维链、状态栏会被折叠或画成面板。
+1. **（可选）草稿 / 思考标签**：分析、推演——若写标签须**成对闭合**，勿只开不关。
+2. **正文**：纯剧情叙事与对白，**不要**包在标签里，**不要**在正文里写 \`<StatusBlock>\` / 分析标签 / HTML 注释导演旁注。
+   - **剧情回合**：正文必有；篇幅与思维链格式**以本轮是否注入的用户预设为准**（有预设跟预设，无预设则 harness 缺省约 800–1500 字可见正文，短打可约 400）。
+   - **纯非剧情回合**：正文非必有；本轮不注入预设，办完即可，勿硬套剧情字数/思维链模板。
+3. **（可选）状态栏** \`<StatusBlock>…</StatusBlock>\`：给面板用。
+- 禁止用加长草稿/状态栏「凑字数」。状态栏与分析进标签，**正文仍是纯叙事**。`,
 	);
 
 	const toolLines = [
@@ -97,12 +106,16 @@ export function buildSystemPrompt({ card, config, constantLore, presetSystemBloc
 		`- tts：文生音——把对白/旁白合成语音并在对话中展示播放器。用户要求配音、朗读时用；text 宜单段，勿一次塞整章。需服务器配置 TTS（LIYUAN_TTS_API_KEY 或 OPENAI_API_KEY）。`,
 		`- panel_write / panel_read / panel_close：你在对话旁拥有自己的展示面板（地图、装备库、线索板、关系图……种类不设限，由剧情需要发明）。剧情出现值得持续可视化的信息时主动建面板，其中的事实变化时及时更新（同名写入即整体替换；不确定当前内容就先 panel_read 核对）。kind 按需选：markdown（清单/表格/线索板）、svg（手绘地图/示意图，务必写 viewBox）、html（富排版，侧栏静态）。面板只放元信息，绝不把剧情正文写进面板；不再需要的面板用 panel_close 收起。`,
 	];
+	toolLines.push(
+		`委托助手（系统事务出口）：`,
+		`- **assistant_run**：把系统/运维/作者向任务交给右栏助手。用户要调 API、生图、改配置、诊断时优先用它；过程在右栏可见，媒体可同步到本对话。`,
+		`- 参数 continue_story：仅当用户同一句里还要求继续演戏时设 true；纯办事省略即可。`,
+	);
 	if (config.backendControl !== false) {
 		toolLines.push(
-			`通用工具（bash / read / write 等，可操作本机）：`,
-			`- 仅在用户明确要求、且服务于当前剧情时使用（如「给这个场景生成一张图」「查一下××」），完成后把结果自然融入回应，不打断叙事节奏。`,
-			`- 优先照技能库笔记调用（见技能库一节）。没有对应技能的陌生服务不要在剧情中途自己摸索——请用户找输入框右边的「助手」接通。`,
-			`- 【纪律】覆盖或删除文件等不可逆操作，先向用户说明并得到确认再执行；绝不主动读取或外传密钥类文件。`,
+			`本机只读/轻量工具（bash / read 等）：`,
+			`- 已有技能笔记、只需照做的短调用可用；**陌生服务摸索、改配置、长工程**走 assistant_run。`,
+			`- 【纪律】不可逆操作先确认；不主动外传密钥。`,
 		);
 	}
 	toolLines.push(`状态账本有后台自动记录最终兜底——【世界状态】给出的事实（物品归属、时间、地点、关系）必须遵守。`);
@@ -132,13 +145,13 @@ export function buildSystemPrompt({ card, config, constantLore, presetSystemBloc
 		);
 	}
 
-	// 技能库（PLAN-PHASE3 §6.4）：调用笔记的「使用」留在剧情侧；「摸索与沉淀」归右栏助手（2026-07-14 拆分）
+	// 技能库：清单给你判断；接通与沉淀优先 assistant_run → 助手
 	if (config.backendControl !== false) {
 		sections.push(
 			`# 技能库
-.liyuan-skills/ 里是摸通外部服务后沉淀的调用笔记（由「助手」维护，你也能用）。用户在剧情中要求调用外部服务（生图、TTS、任何本机/远程 API）时：
-- 先看下面的技能清单：有对应技能就先用 read 读该文件，按笔记直接调用，不要重新摸索。
-- 清单里没有：如实告诉用户该服务还没接通，请他到输入框右边的「助手」处接通——助手摸通后会沉淀成技能，此后你可直接照用。
+.liyuan-skills/ 是外部服务调用笔记（助手可沉淀，你可 read 照做）。
+- 用户要调外部服务：优先 **assistant_run** 让助手按笔记执行或新接通；你也可在已有笔记时 read 后自己短调用。
+- 清单供你知道「已接通哪些能力」，不必向用户推销右栏按钮。
 当前技能清单：
 ${formatSkillIndex(skills ?? [])}`,
 		);
@@ -169,7 +182,9 @@ ${mcpIndex}`,
 
 	if (presetSystemBlocks && presetSystemBlocks.length > 0) {
 		const blockText = presetSystemBlocks.map((b) => m(b.content)).join("\n\n");
-		sections.push(`# 预设指令（用户自备，按原序）\n${blockText}`);
+		sections.push(
+			`# 预设指令（用户自备·剧情生成专用，按原序）\n以下块仅在剧情生成回合由 harness 注入；字数/文风/思维链以本区及末端 postHistory 为准。\n${blockText}`,
+		);
 	}
 
 	if (card.systemPrompt) {
@@ -182,8 +197,7 @@ ${mcpIndex}`,
 /**
  * 用户本轮是否在「求方向 / 要共创定型 / 把笔递出」（ask 档升格强制 ask_director）。
  * 命中时 harness 在末端钉「第一个动作必须是 ask_director」——不只靠模型自觉。
- * 场外标记消息不会进剧情会话（已在 server 层改道助手），无需在此排除；
- * 短句/内心独白末句带这些也算。
+ * 主框消息均进剧情会话（2026-07-18 起不再硬改道）；短句/内心独白末句带求方向也算。
  *
  * 注意：弹窗仍由模型调用 ask_director 触发；本函数只决定是否升格为强制提示。
  * 身份/人设生成与「怎么办」同等对待——直接代写完整档案不算完成任务。
@@ -224,9 +238,17 @@ export interface TurnInjectionOptions {
 	languageMismatch?: boolean;
 	/** 审计器发现的上一轮正文与账本的矛盾（注入提醒，正文由用户决定是否重演——D10） */
 	auditWarnings?: string[];
-	/** 预设 post-history 区块（ST 语义：末端注入，权重最高；depth 小者更靠末端） */
+	/** 预设 post-history 区块（ST 语义：末端注入，权重最高；depth 小者更靠末端）。纯非剧情回合应不传。 */
 	presetPostHistoryBlocks?: PresetBlock[];
-	/** 活跃面板速览（formatPanelIndex 产出，如「地图(svg)、装备库(markdown)」）；无面板缺省 */
+	/**
+	 * 本轮是否装配剧情预设。false 时 harness 已跳过 system/postHistory 预设块，
+	 * 末端注明「不走预设」，避免模型仍按记忆里的字数模板硬写。
+	 */
+	applyStoryPreset?: boolean;
+	/**
+	 * 活跃面板注入正文：优先 formatPanelSnapshot（含当前 content，用户手改后模型可见）；
+	 * 亦可传 formatPanelIndex 的一行速览（旧调用兼容）。
+	 */
 	panelIndex?: string;
 	/** 挂载知识库速览（formatCodexIndex 产出，如「九州风物志(12 条)」）；无挂载缺省 */
 	codexIndex?: string;
@@ -244,6 +266,7 @@ export function buildTurnInjection({
 	config,
 	languageMismatch,
 	presetPostHistoryBlocks,
+	applyStoryPreset = true,
 	panelIndex,
 	codexIndex,
 	uploadIndex,
@@ -257,9 +280,19 @@ export function buildTurnInjection({
 		`【世界状态】当前事实基准，正文不得与之矛盾——物品在谁手里、现在是第几天几点、人在哪里，以下面为准；剧情记忆与之冲突时在叙事内自然圆回：\n${formatState(state)}`,
 	);
 
-	// 活跃面板速览（柱 2）：让模型每轮都记得自己建过哪些面板——建了不更新的面板比没有更糟。
+	// 活跃面板当前内容（柱 2）：用户手改后已同步进扩展内存；此处注入全文快照（或旧式一行索引）。
+	// 模型续写必须以这里为准，禁止凭记忆用过时内容整页 panel_write 盖掉。
 	if (panelIndex) {
-		blocks.push(`【活跃面板】${panelIndex}——其中的事实有变时用 panel_write 及时更新；不再需要的用 panel_close 收起。`);
+		const looksLikeSnapshot = panelIndex.includes("### ") || panelIndex.includes("\n");
+		if (looksLikeSnapshot) {
+			blocks.push(
+				`【活跃面板·当前内容】以下为磁盘/用户最新版（含手改）。剧情事实与 panel_write 不得与之矛盾；不确定时先 panel_read；不再需要的用 panel_close。\n${panelIndex}`,
+			);
+		} else {
+			blocks.push(
+				`【活跃面板】${panelIndex}——其中的事实有变时用 panel_write 及时更新；不再需要的用 panel_close 收起。`,
+			);
+		}
 	}
 
 	// 挂载知识库速览（柱 3）：让模型每轮记得挂着哪些库——既是检索来源，也是主动入库的提醒。
@@ -283,12 +316,16 @@ export function buildTurnInjection({
 		blocks.push(`【相关设定】\n${lore}`);
 	}
 
-	// 预设 post-history 块：ST 语义中最贴近生成点的用户自备指令，排在导演备注之前
-	if (presetPostHistoryBlocks && presetPostHistoryBlocks.length > 0) {
+	// 预设 post-history：仅剧情生成回合注入（ST 字数/思维链等模板压在这里）
+	if (applyStoryPreset && presetPostHistoryBlocks && presetPostHistoryBlocks.length > 0) {
 		const sorted = [...presetPostHistoryBlocks].sort(
 			(a, b) => (b.depth ?? 0) - (a.depth ?? 0), // depth 大者更早出现（离末端更远）
 		);
 		blocks.push(`【预设末端指令】\n${sorted.map((b) => applyMacros(b.content, macro)).join("\n\n")}`);
+	} else if (!applyStoryPreset) {
+		blocks.push(
+			`【本轮不走预设】判定为纯非剧情（办事/面板/配置等）。用户自备的文风·字数·思维链模板**未注入**；办完工具即可收束，可零正文或一句短确认，禁止按剧情模板硬开长文。`,
+		);
 	}
 
 	// 末端导演备注：上下文末尾的指令权重最大（ST 的 post-history instructions 同理）。
@@ -297,13 +334,17 @@ export function buildTurnInjection({
 	if (card.postHistoryInstructions) {
 		notes.push(applyMacros(card.postHistoryInstructions, macro));
 	}
-	notes.push(`以${config.language}继续叙事与对白（专有名词可保留原文）；不替 ${config.userName} 行动、说话或代述想法。`);
+	notes.push(`以${config.language}写叙事与对白（专有名词可保留原文）；不替 ${config.userName} 行动、说话或代述想法。`);
 	notes.push(
-		`用户消息一律是剧情输入（含怎么办/下一步这类抉择）；禁止助手口吻聊剧情。系统与工具事务不归你管，指给输入框右边的「助手」。`,
+		`用户消息一律先由你接（含怎么办/下一步这类抉择）；禁止助手口吻聊剧情。系统/API/配置类办事用 assistant_run 委托，不要推诿「去点右栏」。`,
 	);
-	notes.push(
-		`正文字数只计用户可见叙事（约 800–1500 字，短打可约 400）；draft_notes/思维链/StatusBlock 不计字，勿靠它们凑篇幅。`,
-	);
+	if (applyStoryPreset) {
+		notes.push(
+			`本轮为剧情生成：篇幅与输出格式优先遵循上方【预设末端指令】（若有）；无预设时可见正文 harness 缺省约 800–1500 字（短打约 400）。draft_notes/思维链/StatusBlock 不计字。`,
+		);
+	} else {
+		notes.push(`本轮为非剧情办事：不套用预设字数/思维链；工具结果交回后倾向结束，勿续写长剧情。`);
+	}
 	// 决策门禁：末端钉死；求方向 / 身份生成等句升级为强制调用
 	if (config.creationMode === "ask") {
 		const seeks = userText ? userSeeksDirection(userText) : false;

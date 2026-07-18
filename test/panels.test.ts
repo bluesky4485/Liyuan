@@ -8,6 +8,7 @@ import {
 	activePanels,
 	closePanel,
 	formatPanelIndex,
+	formatPanelSnapshot,
 	loadPanels,
 	PANEL_MAX_CHARS,
 	PANEL_SOFT_LIMIT,
@@ -97,4 +98,19 @@ test("formatPanelIndex：速览行；无活跃面板为 null", () => {
 	r = writePanel(panels, { name: "装备库", kind: "markdown", content: "-" });
 	panels = r.ok ? r.panels : {};
 	assert.equal(formatPanelIndex(panels), "地图(svg)、装备库(markdown)");
+});
+
+test("formatPanelSnapshot：含当前 content；手改后模型可见", () => {
+	assert.equal(formatPanelSnapshot({}), null);
+	let r = writePanel({}, { name: "角色仓库", kind: "markdown", content: "- 青梧：好感 3" });
+	const panels = r.ok ? r.panels : {};
+	const snap = formatPanelSnapshot(panels);
+	assert.ok(snap && snap.includes("角色仓库"));
+	assert.ok(snap.includes("好感 3"), "全文进快照");
+	// 超长截断
+	const long = "x".repeat(100);
+	r = writePanel({}, { name: "巨", kind: "markdown", content: long });
+	const clipped = formatPanelSnapshot(r.ok ? r.panels : {}, { maxPerPanel: 20, maxTotal: 500 });
+	assert.ok(clipped && clipped.includes("截断"));
+	assert.ok(clipped && !clipped.includes(long));
 });

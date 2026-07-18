@@ -1,7 +1,8 @@
 /**
  * 角色卡常见「状态栏」标签的展示层拆分。
  *
- * 标签本身（&lt;StatusBlock&gt; 等）从不进入正文；只抽出 body 画面板。
+ * 与后端 postprocess 策略对齐：**名称像状态** → 抽成面板；不维护无穷精确名单。
+ * 标签本身不进正文；只抽出 body 画面板。
  */
 
 export type StatusPart =
@@ -10,7 +11,16 @@ export type StatusPart =
 
 /** 规范化标签名（小写 + 去下划线）便于匹配 */
 export function normalizeStatusTag(tag: string): string {
-	return tag.toLowerCase().replace(/_/g, "");
+	return tag.trim().toLowerCase().replace(/_/g, "");
+}
+
+/** 名称是否像状态栏（与 src/postprocess PANEL_NAME_RE 同思路） */
+export function isPanelTagName(tag: string): boolean {
+	const raw = tag.trim();
+	const n = normalizeStatusTag(raw);
+	return /^(?:status(?:block|bar)?|normalstatus|specialstatus|char(?:acter)?status|状态|状态栏|人物状态|场景状态)$/i.test(
+		n,
+	) || /^(?:status(?:_?block|bar)?|normal_?status|special_?status)$/i.test(raw);
 }
 
 /** 已知标签 → 中文标题（键用 normalizeStatusTag） */
@@ -20,33 +30,24 @@ const LABEL_BY_NORM: Record<string, string> = {
 	statusblock: "状态",
 	status: "状态",
 	statusbar: "状态",
-	plot: "剧情",
-	splot: "支线",
 	descriptiveanalysis: "描写分析",
 	nextcharacterpanel: "角色登场",
 };
 
-/** 开标签名列表（原始写法，正则用） */
-const KNOWN_TAG_ALTS = [
-	"normal_status",
-	"special_status",
-	"StatusBlock",
-	"status_block",
-	"statusblock",
-	"status",
-	"statusbar",
-	"plot",
-	"splot",
-	"descriptive_analysis",
-	"NextCharacterPanel",
-];
+/** 任意「像状态」的开标签 + 少量历史别名 */
+const OPEN_RE =
+	/<(StatusBlock|status_block|statusblock|status|statusbar|normal_status|special_status|NextCharacterPanel|[A-Za-z_\u4e00-\u9fff][\w\u4e00-\u9fff.\-]*)(?:\s[^>]*)?>/gi;
 
-const OPEN_RE = new RegExp(`<(${KNOWN_TAG_ALTS.join("|")})(?:\\s[^>]*)?>`, "gi");
+function isStatusOpen(tag: string): boolean {
+	const n = normalizeStatusTag(tag);
+	// 历史别名：曾当面板渲染的（descriptive_analysis 已改走思维链，此处不再画面板）
+	if (n === "nextcharacterpanel") return true;
+	return isPanelTagName(tag);
+}
 
-/** plot / splot 闭合互通；StatusBlock 族互通 */
+/** plot 等不再当状态面板——后端已 unwrap 进正文；此处只处理 panel 族 */
 function closePattern(tag: string): RegExp {
 	const n = normalizeStatusTag(tag);
-	if (n === "plot" || n === "splot") return /<\/(?:plot|splot)\s*>/i;
 	if (n === "statusblock" || n === "status" || n === "statusbar") {
 		return /<\/(?:StatusBlock|status_block|statusblock|status|statusbar)\s*>/i;
 	}
@@ -56,7 +57,7 @@ function closePattern(tag: string): RegExp {
 }
 
 /**
- * 顺序扫描：开标签 → 闭合 → body 进 status 段；标签本身不进 text 段。
+ * 顺序扫描：仅状态类开标签 → 闭合 → body 进 status 段；其它标签留给正文（后端多已 unwrap）。
  */
 export function splitStatusParts(text: string): StatusPart[] {
 	if (!text) return [];
@@ -65,9 +66,13 @@ export function splitStatusParts(text: string): StatusPart[] {
 	OPEN_RE.lastIndex = 0;
 	let m: RegExpExecArray | null;
 	while ((m = OPEN_RE.exec(text)) !== null) {
+		const tag = m[1];
+		if (!isStatusOpen(tag)) {
+			// 非状态标签：跳过这个开标签位置，继续找（避免把 <content> 当状态）
+			continue;
+		}
 		const openStart = m.index;
 		const openEnd = m.index + m[0].length;
-		const tag = m[1];
 		if (openStart > cursor) {
 			const chunk = text.slice(cursor, openStart);
 			if (chunk) parts.push({ kind: "text", text: stripOrphanStatusTags(chunk) });
@@ -83,8 +88,18 @@ export function splitStatusParts(text: string): StatusPart[] {
 			body = rest.slice(0, closeM.index);
 			nextCursor = openEnd + closeM.index + closeM[0].length;
 		} else {
+			// 无闭合：吃到下一个状态开标签或文末
 			OPEN_RE.lastIndex = openEnd;
-			const nextOpen = OPEN_RE.exec(text);
+			let nextOpen: RegExpExecArray | null = null;
+			let probe: RegExpExecArray | null;
+			const saved = OPEN_RE.lastIndex;
+			while ((probe = OPEN_RE.exec(text)) !== null) {
+				if (probe.index >= openEnd && isStatusOpen(probe[1])) {
+					nextOpen = probe;
+					break;
+				}
+			}
+			OPEN_RE.lastIndex = saved;
 			if (nextOpen && nextOpen.index >= openEnd) {
 				body = text.slice(openEnd, nextOpen.index);
 				nextCursor = nextOpen.index;
@@ -96,7 +111,7 @@ export function splitStatusParts(text: string): StatusPart[] {
 
 		body = body.replace(/^\uFEFF/, "").trim();
 		const norm = normalizeStatusTag(tag);
-		if (norm !== "descriptiveanalysis" && body) {
+		if (body) {
 			parts.push({ kind: "status", tag: norm, body });
 		}
 		cursor = nextCursor;
@@ -112,7 +127,10 @@ export function splitStatusParts(text: string): StatusPart[] {
 /** 兜底：正文段里若还残留状态标签字样，删掉 */
 export function stripOrphanStatusTags(text: string): string {
 	return text
-		.replace(/<\/?(?:StatusBlock|status_block|statusblock|status|statusbar|normal_status|special_status)(?:\s[^>]*)?>/gi, "")
+		.replace(
+			/<\/?(?:StatusBlock|status_block|statusblock|status|statusbar|normal_status|special_status)(?:\s[^>]*)?>/gi,
+			"",
+		)
 		.replace(/^\s*$/gm, "")
 		.replace(/\n{3,}/g, "\n\n")
 		.trim();

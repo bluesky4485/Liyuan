@@ -113,3 +113,42 @@ export function formatPanelIndex(panels: PanelMap): string | null {
 	if (active.length === 0) return null;
 	return active.map((p) => `${p.name}(${p.kind})`).join("、");
 }
+
+/** 单面板注入正文上限（字符）；超长截断并提示 panel_read */
+export const PANEL_INJECT_MAX_PER = 8_000;
+/** 全部活跃面板注入总上限 */
+export const PANEL_INJECT_MAX_TOTAL = 24_000;
+
+/**
+ * 末端注入用的活跃面板**当前内容**快照（用户手改后须进上下文，不能只给名字）。
+ * 超长按面板/总量截断，完整内容仍可用 panel_read。
+ */
+export function formatPanelSnapshot(
+	panels: PanelMap,
+	opts?: { maxPerPanel?: number; maxTotal?: number },
+): string | null {
+	const maxPer = opts?.maxPerPanel ?? PANEL_INJECT_MAX_PER;
+	const maxTotal = opts?.maxTotal ?? PANEL_INJECT_MAX_TOTAL;
+	const active = activePanels(panels);
+	if (active.length === 0) return null;
+
+	const parts: string[] = [];
+	let used = 0;
+	for (const p of active) {
+		let body = p.content;
+		let clipped = false;
+		if (body.length > maxPer) {
+			body = `${body.slice(0, maxPer)}\n…（已截断，完整内容用 panel_read）`;
+			clipped = true;
+		}
+		const head = `### ${p.name}（${p.kind}${clipped ? "，截断" : ""}）`;
+		const block = `${head}\n${body}`;
+		if (used + block.length > maxTotal) {
+			parts.push(`### ${p.name}（${p.kind}）\n…（注入篇幅已满，用 panel_read 查看全文）`);
+			break;
+		}
+		parts.push(block);
+		used += block.length;
+	}
+	return parts.join("\n\n");
+}

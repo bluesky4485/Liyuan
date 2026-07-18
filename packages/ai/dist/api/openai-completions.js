@@ -1,5 +1,6 @@
 import OpenAI from "openai";
 import { calculateCost, clampThinkingLevel } from "../models.js";
+import { abortableAsyncIterable } from "../utils/abort-signals.js";
 import { formatProviderError, normalizeProviderError } from "../utils/error-body.js";
 import { AssistantMessageEventStream } from "../utils/event-stream.js";
 import { headersToRecord } from "../utils/headers.js";
@@ -229,7 +230,9 @@ export const stream = (model, context, options) => {
                 applyPendingReasoningDetail(block);
                 return block;
             };
-            for await (const chunk of openaiStream) {
+            // Race each chunk against AbortSignal so Stop works even when a proxy
+            // ignores HTTP cancellation and never closes the SSE body.
+            for await (const chunk of abortableAsyncIterable(openaiStream, options?.signal)) {
                 if (!chunk || typeof chunk !== "object")
                     continue;
                 // OpenAI documents ChatCompletionChunk.id as the unique chat completion identifier,

@@ -56,7 +56,8 @@ export function buildStagehandPrompt({ config, skills }: StagehandPromptOptions)
 你能写世界书、建知识库、修账本、造角色卡、写剧情侧面板——这些都是剧情资产，不是「用户读到的剧情正文」，尽管做。唯一的红线是那段叙事本身：
 - 用户要求「把上一轮写好一点/改一改」时，正确动作是调整生产条件（配置、预设、账本、设定），再用 story_command 触发重新生成（/reroll）；或把修改思路讲给用户，由他自己动笔改。绝不亲手改写剧情正文顶替。
 - 剧情走向的正式决策发生在剧情对话里。用户在这里问剧情走向时，可以给场外分析与建议，但要说明这只是参考，定夺请回剧情对话进行。
-- 建面板、交付素材时：面板写入剧情侧展示区（show_media 的素材只落在你自己这条助手对话里），都不会进剧情消息流——那条流 100% 属于剧情模型。`,
+- 建面板：写入剧情侧展示区，不是叙事正文。
+- 交付图/音/视频：**必须 show_media**（入库 /media/、右栏可见；**剧情委托时同步中间对话**）。禁止只写本机路径就算完成。`,
 	);
 
 	sections.push(
@@ -80,13 +81,16 @@ export function buildStagehandPrompt({ config, skills }: StagehandPromptOptions)
 		`- preset_toggle：开关某个预设块（下一轮生成生效）。`,
 		`- world_write：改世界状态账本（applyPatch 语义，修账用）。`,
 		`作者写入（改前确认；写完自动反映到剧情界面）：`,
-		`- panel_write：写剧情侧展示面板（地图/装备库/线索板等）。空间/布局类地图优先 kind="svg"（矢量、可标注、能一步步更新），别用生图；同名覆盖。`,
+		`- panel_write：写剧情侧展示面板（地图/装备库/线索板等）。空间/布局类地图优先 kind="svg"（矢量、可标注、能一步步更新），别用生图；同名覆盖。侧栏窄，svg 务必带 viewBox。`,
 		`- lorebook_write：把新的世界观正典写进补充设定集（跨会话保留、可被检索）。只记设定，剧情进展用 world_write。`,
 		`- codex_create / codex_write / codex_mount：建命名知识库 / 写条目 / 挂载到剧情（挂载后其条目并入剧情检索）。`,
 		`- card_create：在 assets/cards/ 建一张新角色卡（JSON），建好告诉用户去角色卡库打开，不自动切换。`,
 		`交付与沉淀：`,
-		`- show_media：把你生成的本机媒体（图/音/视频）交付到**本条助手对话**给用户看（不进剧情流）。`,
+		`- **show_media（生图/录音后必调）**：source=本机文件路径。复制进项目媒体库、右栏可见；**剧情委托时同时推到中间剧情对话**。禁止只写路径或只 return_answer——用户看不到磁盘文件。`,
 		`- skill_save：把摸通的服务调用方法沉淀为技能笔记（同名保存即更新）。`,
+		`委托交回与协作：`,
+		`- **return_answer**：任务完成（或确认失败）后，把给剧情侧的结论交回去。剧情委托回合**办完必须调**；不要只写在聊天里就停。`,
+		`- **ask_user**：卡住、缺信息、要用户拍板时用选择卡。选项里会保证有「放弃并返回」——用户可随时收束委托。`,
 	];
 	if (config.backendControl !== false) {
 		toolLines.push(
@@ -96,7 +100,14 @@ export function buildStagehandPrompt({ config, skills }: StagehandPromptOptions)
 	sections.push(toolLines.join("\n"));
 
 	sections.push(
-		`# 操作纪律
+		`# 完成判据（何时 return_answer）
+你自己判断任务是否可交回，不要等用户催：
+- **可交回**：用户要的结果已产出（**图/音/视频必须已 show_media 交付**、配置已改、面板已写、诊断结论已形成），或已确认无法完成并写清原因。
+- **生图/媒体任务**：curl/脚本落盘成功 ≠ 完成。必须再 **show_media(source=绝对路径)**，看到工具返回「已交付」后才能 return_answer。
+- **还不能交回**：还在探索、还缺关键参数、工具仍在失败重试——继续干，或 **ask_user** 问用户。
+- **卡住**：不要静默停住。调用 ask_user，说明卡点，给出 2～4 个可选项；系统会确保有「放弃并返回」。用户选放弃后你再 return_answer(abandoned)。
+
+# 操作纪律
 - 一切改变状态的操作（改配置、改预设、换模型、回退剧情、修账本）：先向用户复述将要做的变更，得到确认再动手；完成后报告实际结果。用户在同一轮已明确说了要改什么值的，视为已确认。
 - 不可逆操作（删除、覆盖文件）加倍谨慎；绝不主动读取或外传密钥类文件（api key、token、auth 配置）。
 - 工具报错时把错误原文简要告知用户，不假装成功；拒绝或失败都如实呈现。
@@ -136,7 +147,12 @@ export interface StorySnapshot {
 	assistantFollows?: boolean;
 }
 
-export function buildStagehandInjection(s: StorySnapshot): string {
+export function buildStagehandInjection(
+	s: StorySnapshot & {
+		/** 当前是否剧情侧 assistant_run 委托回合 */
+		delegateActive?: boolean;
+	},
+): string {
 	const lines = [
 		`【剧情快照】`,
 		`- 剧情会话 ${s.sessionId.slice(0, 8)} · 角色卡「${s.cardName}」 · 用户「${s.userName}」 · 消息 ${s.messageCount} 条${s.streaming ? " · 正在生成中（你的变更会排队到本轮结束）" : ""}`,
@@ -144,6 +160,15 @@ export function buildStagehandInjection(s: StorySnapshot): string {
 	];
 	if (s.assistantModel && !s.assistantFollows) {
 		lines.push(`- 你自己运行在 ${s.assistantModel.provider}/${s.assistantModel.id}（独立于剧情模型）`);
+	}
+	if (s.delegateActive) {
+		lines.push(
+			`【委托回合 · 必读】本轮由剧情侧委托。请自己判断是否完成：`,
+			`- 做完 → **return_answer** 把结论交回剧情侧（不要只聊不交）。`,
+			`- **图/音/视频**：落盘后必须 **show_media(本机路径)**（png/mp3/mp4 等），才会进剧情对话与媒体库；禁止只写路径就交回。`,
+			`- 卡住 / 缺信息 → **ask_user** 给选项（含「放弃并返回」），勿静默停住。`,
+			`- 用户放弃 → return_answer 并标明 abandoned。`,
+		);
 	}
 	return lines.join("\n");
 }

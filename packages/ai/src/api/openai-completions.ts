@@ -32,6 +32,7 @@ import type {
 	ToolCall,
 	ToolResultMessage,
 } from "../types.ts";
+import { abortableAsyncIterable } from "../utils/abort-signals.ts";
 import { formatProviderError, normalizeProviderError } from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { headersToRecord } from "../utils/headers.ts";
@@ -314,7 +315,9 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 				return block;
 			};
 
-			for await (const chunk of openaiStream) {
+			// Race each chunk against AbortSignal so Stop works even when a proxy
+			// ignores HTTP cancellation and never closes the SSE body.
+			for await (const chunk of abortableAsyncIterable(openaiStream, options?.signal)) {
 				if (!chunk || typeof chunk !== "object") continue;
 
 				// OpenAI documents ChatCompletionChunk.id as the unique chat completion identifier,

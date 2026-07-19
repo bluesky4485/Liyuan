@@ -60,6 +60,63 @@ test("含 toolCall 的中间 assistant（含计划旁白）跳过，避免叠多
 	});
 });
 
+test("用户中断 aborted：半截正文上屏并标 unfinished", () => {
+	const half = {
+		role: "assistant",
+		stopReason: "aborted",
+		content: [{ type: "text", text: "*他抬眼*「你来了——」" }],
+	};
+	assert.deepEqual(toWireMsg(half, names), {
+		channel: "narrative",
+		name: "青梧",
+		text: "*他抬眼*「你来了——」",
+		unfinished: true,
+	});
+});
+
+test("用户中断 aborted：仅 thinking 也上屏（不因无 text 整条 null）", () => {
+	const thinkOnly = {
+		role: "assistant",
+		stopReason: "aborted",
+		content: [{ type: "thinking", thinking: "先设计世家近侍再落笔…" }],
+	};
+	const w = toWireMsg(thinkOnly, names);
+	assert.ok(w);
+	assert.equal(w?.unfinished, true);
+	assert.ok(w?.thinking?.includes("世家近侍"));
+	assert.match(w?.text ?? "", /正文未流出|思维链/);
+});
+
+test("用户中断 aborted：正文+toolCall 仍上屏（半截不被中间轮规则吃掉）", () => {
+	const midAbort = {
+		role: "assistant",
+		stopReason: "aborted",
+		content: [
+			{ type: "text", text: "新角色定为近侍，先写入设定。" },
+			{ type: "toolCall", id: "t1", name: "lorebook_write", arguments: {} },
+		],
+	};
+	const w = toWireMsg(midAbort, names);
+	assert.ok(w);
+	assert.equal(w?.unfinished, true);
+	assert.ok(w?.text.includes("近侍"));
+});
+
+test("toWireHistory：aborted 半截在 resync/hello 后仍在", () => {
+	const history = [
+		{ role: "user", content: "继续" },
+		{
+			role: "assistant",
+			stopReason: "aborted",
+			content: [{ type: "thinking", thinking: "长思考中" }],
+		},
+	];
+	const wire = toWireHistory(history, names);
+	assert.equal(wire.length, 2);
+	assert.equal(wire[1].channel, "narrative");
+	assert.equal(wire[1].unfinished, true);
+});
+
 test("显示层剥预设脚手架：draft_notes/content/HTML 注释；假思维链进 thinking 折叠", () => {
 	const msg = {
 		role: "assistant",

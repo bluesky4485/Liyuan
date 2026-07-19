@@ -109,6 +109,12 @@ async function runLoop(initialContext, newMessages, initialConfig, signal, emit,
                 await emit({ type: "agent_end", messages: newMessages });
                 return;
             }
+            // User hit Stop while waiting on tools / between stream and tools
+            if (signal?.aborted) {
+                await emit({ type: "turn_end", message, toolResults: [] });
+                await emit({ type: "agent_end", messages: newMessages });
+                return;
+            }
             // Check for tool calls
             const toolCalls = message.content.filter((c) => c.type === "toolCall");
             const toolResults = [];
@@ -116,13 +122,18 @@ async function runLoop(initialContext, newMessages, initialConfig, signal, emit,
             if (toolCalls.length > 0) {
                 const executedToolBatch = await executeToolCalls(currentContext, message, config, signal, emit);
                 toolResults.push(...executedToolBatch.messages);
-                hasMoreToolCalls = !executedToolBatch.terminate;
+                hasMoreToolCalls = !executedToolBatch.terminate && !signal?.aborted;
                 for (const result of toolResults) {
                     currentContext.messages.push(result);
                     newMessages.push(result);
                 }
             }
             await emit({ type: "turn_end", message, toolResults });
+            // Stop after tools (e.g. ask_director 用户点停) — 不得再开下一轮 LLM
+            if (signal?.aborted) {
+                await emit({ type: "agent_end", messages: newMessages });
+                return;
+            }
             const nextTurnContext = {
                 message,
                 toolResults,
@@ -142,6 +153,10 @@ async function runLoop(initialContext, newMessages, initialConfig, signal, emit,
                             : nextTurnSnapshot.thinkingLevel,
                 };
             }
+            if (signal?.aborted) {
+                await emit({ type: "agent_end", messages: newMessages });
+                return;
+            }
             if (await config.shouldStopAfterTurn?.({
                 message,
                 toolResults,
@@ -154,6 +169,10 @@ async function runLoop(initialContext, newMessages, initialConfig, signal, emit,
             pendingMessages = (await config.getSteeringMessages?.()) || [];
         }
         // Agent would stop here. Check for follow-up messages.
+        if (signal?.aborted) {
+            await emit({ type: "agent_end", messages: newMessages });
+            return;
+        }
         const followUpMessages = (await config.getFollowUpMessages?.()) || [];
         if (followUpMessages.length > 0) {
             // Set as pending so inner loop processes them
@@ -329,7 +348,8 @@ async function executeToolCallsSequential(currentContext, assistantMessage, tool
     }
     return {
         messages,
-        terminate: shouldTerminateToolBatch(finalizedCalls),
+        // Abort mid-batch: terminate so the outer loop cannot start another LLM turn
+        terminate: signal?.aborted === true || shouldTerminateToolBatch(finalizedCalls),
     };
 }
 async function executeToolCallsParallel(currentContext, assistantMessage, toolCalls, config, signal, emit) {
@@ -374,7 +394,7 @@ async function executeToolCallsParallel(currentContext, assistantMessage, toolCa
     }
     return {
         messages,
-        terminate: shouldTerminateToolBatch(orderedFinalizedCalls),
+        terminate: signal?.aborted === true || shouldTerminateToolBatch(orderedFinalizedCalls),
     };
 }
 function shouldTerminateToolBatch(finalizedCalls) {

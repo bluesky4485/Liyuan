@@ -1444,14 +1444,18 @@ export class AgentSession {
 
 	/**
 	 * Abort current operation and wait for agent to become idle.
-	 * Also cancels compaction/bash side-runs. Caps wait so a hung provider stream
-	 * cannot leave Stop blocked forever (UI must always be able to force-stop).
+	 * Also cancels compaction/bash side-runs and drops queued steer/follow-ups
+	 * so Stop cannot be followed by a spontaneous extra turn.
+	 * Caps wait so a hung provider stream cannot leave Stop blocked forever.
 	 */
 	async abort(): Promise<void> {
 		this.abortRetry();
 		this.abortCompaction();
 		this.abortBranchSummary();
 		this.abortBash();
+		// Drop queued prompts first — otherwise aborting the stream can still
+		// drain follow-ups and look like "stop doesn't work".
+		this.clearQueue();
 		this.agent.abort();
 		const idle = this.agent.waitForIdle();
 		const timeoutMs = 8_000;

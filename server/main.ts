@@ -104,6 +104,7 @@ import { createAssistantHost, type AssistantHost, type StoryBridge } from "./ass
 import { registerAssistantRunner } from "../src/assistant-gateway.ts";
 import { sameCardPath } from "../src/paths.ts";
 import { syncStoryPanelsFromDisk, syncStoryStateFromDisk } from "../src/story-sync.ts";
+import { toolStartDetail } from "../src/activity-format.ts";
 
 const cwd = process.cwd();
 const HOST = process.env.HOST ?? "0.0.0.0";
@@ -720,13 +721,8 @@ const bindSession = async () => {
 				break;
 			}
 			case "tool_execution_start": {
-				let detail = "";
-				try {
-					detail = JSON.stringify(event.args);
-					if (detail.length > 120) detail = `${detail.slice(0, 120)}…`;
-				} catch {
-					// 参数不可序列化则留空
-				}
+				// RP 人话摘要（非 JSON）；模型台侧旁白另由 stream→note 捕获
+				const detail = toolStartDetail(event.toolName, event.args);
 				broadcast({ type: "activity", activity: { kind: "tool_start", name: event.toolName, detail } });
 				break;
 			}
@@ -1364,13 +1360,7 @@ const onAssistantEvent = (event: unknown) => {
 			break;
 		}
 		case "tool_execution_start": {
-			let detail = "";
-			try {
-				detail = JSON.stringify(ev.args);
-				if (detail.length > 120) detail = `${detail.slice(0, 120)}…`;
-			} catch {
-				// 参数不可序列化则留空
-			}
+			const detail = toolStartDetail(ev.toolName ?? "", ev.args);
 			broadcast({ type: "assistant_activity", activity: { kind: "tool_start", name: ev.toolName ?? "", detail } });
 			break;
 		}

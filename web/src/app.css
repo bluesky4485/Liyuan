@@ -1081,6 +1081,15 @@ html[data-theme="dark"] [data-tip]:focus-visible::after {
 	background: var(--accent-wash);
 	color: var(--accent-strong);
 }
+.chip-unfinished {
+	background: color-mix(in srgb, var(--accent, #c4a574) 18%, transparent);
+	color: var(--accent-strong, var(--accent));
+	border-color: color-mix(in srgb, var(--accent, #c4a574) 45%, var(--hairline));
+}
+.msg-char:has(.chip-unfinished) {
+	/* 未完成稿略作提示，不抢正文 */
+	box-shadow: inset 3px 0 0 color-mix(in srgb, var(--accent, #c4a574) 55%, transparent);
+}
 .msg-edit-box {
 	display: flex;
 	flex-direction: column;
@@ -1271,18 +1280,43 @@ html[data-theme="dark"] [data-tip]:focus-visible::after {
 	margin: 4px 0;
 	line-height: 1.55;
 }
+.ta-call,
+.ta-result {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: baseline;
+	gap: 6px 10px;
+}
 .ta-result {
 	color: var(--text-faint);
-	padding-left: 12px;
+	padding-left: 2px;
 }
 .ta-error {
 	color: var(--accent);
 }
+.ta-label {
+	flex: 0 0 auto;
+	font-size: 11px;
+	font-weight: 600;
+	letter-spacing: 0.02em;
+	color: var(--text-soft);
+	background: color-mix(in srgb, var(--surface-elevated, var(--surface)) 80%, var(--hairline));
+	border: 1px solid var(--hairline);
+	border-radius: 999px;
+	padding: 1px 8px;
+	line-height: 1.5;
+}
 .ta-detail {
-	display: block;
+	flex: 1 1 12rem;
+	display: inline;
+	color: var(--text-soft);
+	word-break: break-word;
+	font-size: 12.5px;
+	line-height: 1.55;
+}
+.ta-detail-muted {
 	color: var(--text-faint);
-	word-break: break-all;
-	font-size: 11.5px;
+	font-style: italic;
 }
 
 .import-block {
@@ -6317,11 +6351,15 @@ label.drawer-btn {
 	padding-top: 0;
 	margin-top: 2px;
 }
-/* 中间旁白(模型调工具前的计划文字,客户端留档) */
+/* 中间旁白(模型调工具前的 RP 导演短句,客户端留档)——过程条主信息 */
 .ta-note {
-	color: var(--text-faint);
+	color: var(--text);
 	white-space: pre-wrap;
 	word-break: break-word;
+	font-size: 13px;
+	line-height: 1.6;
+	padding: 2px 0 2px 10px;
+	border-left: 2px solid color-mix(in srgb, var(--accent, #c4a574) 55%, var(--hairline));
 }
 /* 助手交付的素材(show_media):图片/音视频,与回复文字区隔 */
 .asst-media {

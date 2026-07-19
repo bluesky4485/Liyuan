@@ -45,6 +45,11 @@ export interface WireMsg {
 	text: string;
 	/** 模型思维链（原始输出，UI 折叠呈现；无则缺省） */
 	thinking?: string;
+	/**
+	 * 用户中断导致的未完成稿（stopReason=aborted）。
+	 * 须上屏并进入 hello 重放，以便「停后可见 / 继续写」。
+	 */
+	unfinished?: boolean;
 	/** user 消息专用：带场外标记（//、（）包裹），该轮助手回复走 backstage 通道 */
 	backstage?: boolean;
 	/** image / audio / video 通道：资源地址（http(s) 或本服务 /media/ · /audio/） */
@@ -270,6 +275,8 @@ interface MsgLike {
 	details?: unknown;
 	toolName?: unknown;
 	isError?: unknown;
+	/** assistant 停止原因：aborted = 用户中断，半截稿须可上屏 */
+	stopReason?: unknown;
 }
 
 /** show_image 工具结果 → image 消息（图片通道 §6.5）；非该工具或出错返回 null */
@@ -396,23 +403,45 @@ export function toWireMsg(m: unknown, names: WireNames, opts?: { backstage?: boo
 			: { channel: "user", name: names.userName, text };
 	}
 	if (msg.role === "assistant") {
-		// 纯工具/思考轮无正文：整条跳过（D9 同款判断）
-		if (!text) return null;
-		// 含 toolCall 的中间轮：模型常写「先查 X 再落笔」类计划旁白；若进 narrative
-		// 会叠出多条角色气泡。工具过程条由 activity 帧承担，最终 stop 正文单独展示。
-		// （会话文件仍保留原文；仅影响 Web 显示层。）
-		if (hasToolCall(msg.content)) return null;
+		const aborted = msg.stopReason === "aborted";
 		const channel: WireChannel = opts?.backstage ? "backstage" : "narrative";
-		// 模型原生 thinking 块 + 预设假思维链（<thinking>/<draft_notes>…）折叠展示
 		const modelThinking = thinkingOf(msg.content).trim();
-		const scaffoldThinking = extractScaffoldThinking(text);
+		// 正常中间 tool 轮：跳过（防叠泡）；**用户中断**的半截须上屏，即便夹着 toolCall
+		if (!aborted && hasToolCall(msg.content)) return null;
+		// 正常完成且无正文：跳过；中断时即使无 text 也可能有 thinking，后面单独处理
+		if (!aborted && !text) return null;
+
+		const scaffoldThinking = text ? extractScaffoldThinking(text) : "";
 		const thinking = [modelThinking, scaffoldThinking].filter(Boolean).join("\n\n").trim();
-		// 显示层剥脚手架（会话文件仍保留原文；cleanAssistantText 另管送模历史）
-		const display = channel === "narrative" ? displayAssistantText(text) : text;
-		if (!display && !thinking) return null;
-		return thinking
-			? { channel, name: names.charName, text: display || "（脚手架已折叠，见思维链）", thinking }
-			: { channel, name: names.charName, text: display };
+		const display = text
+			? channel === "narrative"
+				? displayAssistantText(text)
+				: text
+			: "";
+
+		if (!display && !thinking) {
+			// 空中断：仍留一条锚点，避免 agent_end→resync 后像「什么都没发生」
+			if (aborted) {
+				return {
+					channel,
+					name: names.charName,
+					text: "（已停止，本轮尚未生成可见内容）",
+					unfinished: true,
+				};
+			}
+			return null;
+		}
+
+		const body =
+			display ||
+			(aborted ? "（正文未流出，见思维链）" : "（脚手架已折叠，见思维链）");
+		return {
+			channel,
+			name: names.charName,
+			text: body,
+			...(thinking ? { thinking } : {}),
+			...(aborted ? { unfinished: true } : {}),
+		};
 	}
 	if (msg.role === "custom") {
 		if (msg.display === false) return null; // rp-inject 等幕后注入
@@ -494,6 +523,7 @@ export function foldTurnNarratives(msgs: WireMsg[]): WireMsg[] {
 			if (turnRoleIdx >= 0 && turnChannel === m.channel) {
 				const prev = out[turnRoleIdx];
 				const thinking = join(prev.thinking, m.thinking);
+				const unfinished = prev.unfinished === true || m.unfinished === true;
 				out[turnRoleIdx] = {
 					...prev,
 					text: join(prev.text, m.text),
@@ -501,7 +531,9 @@ export function foldTurnNarratives(msgs: WireMsg[]): WireMsg[] {
 					// 变体元数据以最后一段为准（annotateSwipes 挂在末条）
 					...(m.swipe ? { swipe: m.swipe } : prev.swipe ? { swipe: prev.swipe } : {}),
 					...(m.name ? { name: m.name } : {}),
+					...(unfinished ? { unfinished: true } : {}),
 				};
+				if (!unfinished) delete out[turnRoleIdx].unfinished;
 				continue;
 			}
 			turnRoleIdx = out.length;

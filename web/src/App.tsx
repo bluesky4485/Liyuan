@@ -485,13 +485,16 @@ export default function App() {
 			const text = [prev.text, incoming.text].map((s) => (s ?? "").trim()).filter(Boolean).join("\n\n");
 			const thinking = [prev.thinking, incoming.thinking].map((s) => (s ?? "").trim()).filter(Boolean).join("\n\n");
 			const activities = [...(prev.activities ?? []), ...(incoming.activities ?? [])];
+			const unfinished = prev.unfinished === true || incoming.unfinished === true;
 			const merged: ChatMsg = {
 				...prev,
 				...incoming,
 				text,
 				...(thinking ? { thinking } : {}),
 				...(activities.length ? { activities } : {}),
+				...(unfinished ? { unfinished: true } : {}),
 			};
+			if (!unfinished) delete merged.unfinished;
 			return [...ms.slice(0, i), merged, ...ms.slice(i + 1)];
 		}
 		return [...ms, incoming];
@@ -605,30 +608,40 @@ export default function App() {
 					break;
 				case "agent":
 					if (frame.state === "start") {
+						// 新一轮生成：解除停止冻结
 						abortingRef.current = false;
 						setBusy(true);
 						resetActs();
 					} else {
-						abortingRef.current = false;
+						// 服务端 abort 会立刻广播 end，但 provider 流可能仍在吐 delta。
+						// 若用户已按停止：保持 abortingRef，继续丢弃迟到 delta，直到下一次 start。
+						const wasAborting = abortingRef.current;
+						if (!wasAborting) abortingRef.current = false;
 						setBusy(false);
 						setThinkingLive(false);
 						setToolNote(null);
 						// 本轮 agent 可能写了技能/知识库/世界书等资产：通知 watchAgent 面板重拉
 						setAgentTick((t) => t + 1);
-						// 中断/异常遗留的半截正文：并入本轮同一角色泡（不新开泡）
-						if (streamRef.current.trim()) {
-							const text = streamRef.current;
-							const thinking = streamThinkingRef.current.trim();
-							const acts = turnActsRef.current;
+						// 中断/异常遗留的半截正文/思维链：并入本轮同一角色泡（不新开泡）
+						const text = streamRef.current;
+						const thinking = streamThinkingRef.current.trim();
+						const acts = turnActsRef.current;
+						if (text.trim() || thinking || wasAborting) {
 							resetActs();
 							clearStream();
-							const leftover: ChatMsg = {
-								channel: "narrative",
-								text,
-								...(thinking ? { thinking } : {}),
-								...(acts.length ? { activities: acts } : {}),
-							};
-							setMessages((ms) => upsertTurnReply(ms, leftover));
+							if (text.trim() || thinking) {
+								const leftover: ChatMsg = {
+									channel: "narrative",
+									// 仅有思维链时也留痕；unfinished 与 resync 的 aborted 稿对齐
+									text: text.trim() ? text : "（正文未流出，见思维链）",
+									...(thinking ? { thinking } : {}),
+									...(acts.length ? { activities: acts } : {}),
+									...(wasAborting ? { unfinished: true } : {}),
+								};
+								setMessages((ms) => upsertTurnReply(ms, leftover));
+							} else if (wasAborting) {
+								setLiveActs([]);
+							}
 						} else {
 							clearStream();
 							setLiveActs([]);
@@ -642,7 +655,15 @@ export default function App() {
 						clearStream();
 					}
 					pushAct(frame.activity);
-					setToolNote(frame.activity.kind === "tool_start" ? `${toolLabel(frame.activity.name)}…` : null);
+					setToolNote(
+						frame.activity.kind === "tool_start"
+							? frame.activity.detail?.trim()
+								? frame.activity.detail.trim().length > 80
+									? `${frame.activity.detail.trim().slice(0, 80)}…`
+									: frame.activity.detail.trim()
+								: `${toolLabel(frame.activity.name)}…`
+							: null,
+					);
 					break;
 				case "state":
 					setWorldState(frame.state);
@@ -739,21 +760,28 @@ export default function App() {
 						asstActsRef.current = [];
 						setAsstLiveActs([]);
 					} else {
-						asstAbortingRef.current = false;
+						// 同剧情侧：abort 乐观 end 后保持冻结，避免迟到 delta 复活
+						const wasAborting = asstAbortingRef.current;
+						if (!wasAborting) asstAbortingRef.current = false;
 						setAsstBusy(false);
 						setAsstThinkingLive(false);
 						setAsstToolNote(null);
-						// 中断遗留的半截回复：并入消息列表（不丢字）
-						if (asstStreamRef.current.trim()) {
-							const text = asstStreamRef.current;
-							const thinking = asstStreamThinkingRef.current.trim();
-							const acts = asstActsRef.current;
+						// 中断遗留的半截回复/思维链：并入消息列表（不丢字）
+						const text = asstStreamRef.current;
+						const thinking = asstStreamThinkingRef.current.trim();
+						const acts = asstActsRef.current;
+						if (text.trim() || thinking) {
 							asstActsRef.current = [];
 							setAsstLiveActs([]);
 							clearAsstStream();
 							setAsstMsgs((ms) => [
 								...(ms ?? []),
-								{ role: "assistant", text, ...(thinking ? { thinking } : {}), ...(acts.length ? { activities: acts } : {}) },
+								{
+									role: "assistant",
+									text: text.trim() ? text : "（正文未流出，见思维链）",
+									...(thinking ? { thinking } : {}),
+									...(acts.length ? { activities: acts } : {}),
+								},
 							]);
 						} else {
 							clearAsstStream();
@@ -767,7 +795,15 @@ export default function App() {
 					}
 					asstActsRef.current = [...asstActsRef.current, frame.activity];
 					setAsstLiveActs(asstActsRef.current);
-					setAsstToolNote(frame.activity.kind === "tool_start" ? `${toolLabel(frame.activity.name)}…` : null);
+					setAsstToolNote(
+						frame.activity.kind === "tool_start"
+							? frame.activity.detail?.trim()
+								? frame.activity.detail.trim().length > 80
+									? `${frame.activity.detail.trim().slice(0, 80)}…`
+									: frame.activity.detail.trim()
+								: `${toolLabel(frame.activity.name)}…`
+							: null,
+					);
 					break;
 				case "notify":
 					pushToast(frame.level, frame.text);
@@ -1255,12 +1291,12 @@ export default function App() {
 						sessions={asstSessions}
 						onSend={(text) => ws.send({ type: "assistant_prompt", text })}
 						onAbort={() => {
-							// 强制停止：本地立刻解锁助手输入并冻结流式
+							// 强制停止：本地立刻解锁助手输入并冻结流式（保持 asstAbortingRef 直到下次 start）
 							asstAbortingRef.current = true;
 							setAsstBusy(false);
 							setAsstThinkingLive(false);
 							setAsstToolNote(null);
-							if (asstStreamRef.current.trim()) {
+							if (asstStreamRef.current.trim() || asstStreamThinkingRef.current.trim()) {
 								const text = asstStreamRef.current;
 								const thinking = asstStreamThinkingRef.current.trim();
 								const acts = asstActsRef.current;
@@ -1271,7 +1307,7 @@ export default function App() {
 									...(ms ?? []),
 									{
 										role: "assistant" as const,
-										text,
+										text: text.trim() ? text : "（正文未流出，见思维链）",
 										...(thinking ? { thinking } : {}),
 										...(acts.length ? { activities: acts } : {}),
 									},
@@ -1967,7 +2003,8 @@ export default function App() {
 								<button
 									className="btn btn-stop"
 									onClick={() => {
-										// 强制停止：本地立刻解锁输入，冻结流式，不等待服务端确认
+										// 强制停止：本地立刻解锁输入，冻结流式，不等待服务端确认。
+										// abortingRef 保持到下一次 agent:start，防止服务端乐观 end 后迟到 delta 复活。
 										abortingRef.current = true;
 										setBusy(false);
 										setThinkingLive(false);
@@ -1978,15 +2015,15 @@ export default function App() {
 											const acts = turnActsRef.current;
 											resetActs();
 											clearStream();
-											if (text.trim()) {
-												const leftover: ChatMsg = {
-													channel: "narrative",
-													text,
-													...(thinking ? { thinking } : {}),
-													...(acts.length ? { activities: acts } : {}),
-												};
-												setMessages((ms) => upsertTurnReply(ms, leftover));
-											}
+											// 仅有思维链也要留痕；标 unfinished，resync 时与 session aborted 对齐
+											const leftover: ChatMsg = {
+												channel: "narrative",
+												text: text.trim() ? text : "（正文未流出，见思维链）",
+												...(thinking ? { thinking } : {}),
+												...(acts.length ? { activities: acts } : {}),
+												unfinished: true,
+											};
+											setMessages((ms) => upsertTurnReply(ms, leftover));
 										}
 										ws.send({ type: "abort" });
 									}}

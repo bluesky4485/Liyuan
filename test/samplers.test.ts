@@ -57,6 +57,23 @@ test("kimi-k2.5 / o1：profile=none，不发采样", () => {
 	assert.deepEqual(projectSamplers(full, { provider: "openai", modelId: "o1" }), {});
 });
 
+test("kimi-k3（含 opencode 中转）：官方固定采样，profile=none", () => {
+	// 官方：temperature/top_p/penalties 固定，传了会 invalid_request_error
+	assert.equal(resolveSamplerProfile({ provider: "opencode", modelId: "kimi-k3" }), "none");
+	assert.equal(resolveSamplerProfile({ provider: "moonshotai", modelId: "kimi-k3" }), "none");
+	assert.equal(resolveSamplerProfile({ provider: "openrouter", modelId: "moonshotai/kimi-k3" }), "none");
+	assert.deepEqual(projectSamplers(full, { provider: "opencode", modelId: "kimi-k3" }), {});
+	// 旧 kimi-k2 仍可调温
+	assert.equal(resolveSamplerProfile({ provider: "cpa", modelId: "kimi-k2" }), "openai-core");
+});
+
+test("kimi-k2.6 / k2.7：官方固定采样，profile=none", () => {
+	assert.equal(resolveSamplerProfile({ provider: "moonshotai", modelId: "kimi-k2.6" }), "none");
+	assert.equal(resolveSamplerProfile({ provider: "moonshotai", modelId: "kimi-k2.7-code" }), "none");
+	assert.equal(resolveSamplerProfile({ provider: "moonshotai", modelId: "kimi-k2.7-code-highspeed" }), "none");
+	assert.deepEqual(projectSamplers(full, { provider: "moonshotai", modelId: "kimi-k2.6" }), {});
+});
+
 test("top_k=0 视为未启用，不写入", () => {
 	const out = projectSamplers(
 		{ temperature: 0.8, top_k: 0 },
@@ -94,12 +111,36 @@ test("applyProjectedSamplers：去掉盲塞的扩展键，写入投影结果", (
 		top_k: 999,
 		repetition_penalty: 1.2,
 	};
-	const next = applyProjectedSamplers(payload, full, { provider: "cpa", modelId: "kimi-k3" });
+	const next = applyProjectedSamplers(payload, full, { provider: "cpa", modelId: "longcat-2.0" });
 	assert.equal(next.temperature, 1); // 预设覆盖
 	assert.equal(next.top_p, 0.98);
 	assert.ok(!("top_k" in next), "自定义中转不应再带 top_k");
 	assert.ok(!("repetition_penalty" in next));
 	assert.equal(next.model, "x");
+});
+
+test("applyProjectedSamplers：kimi-k3 剥光采样（含 payload 残留）", () => {
+	const payload = {
+		model: "kimi-k3",
+		messages: [],
+		temperature: 0.7,
+		top_p: 1,
+		frequency_penalty: 0.1,
+		presence_penalty: 0,
+		top_k: 40,
+	};
+	const next = applyProjectedSamplers(payload, full, {
+		provider: "opencode",
+		modelId: "kimi-k3",
+		baseUrl: "https://opencode.ai/zen/go/v1",
+	});
+	assert.equal(next.model, "kimi-k3");
+	assert.ok(!("temperature" in next));
+	assert.ok(!("top_p" in next));
+	assert.ok(!("frequency_penalty" in next));
+	assert.ok(!("presence_penalty" in next));
+	assert.ok(!("top_k" in next));
+	assert.ok(!("repetition_penalty" in next));
 });
 
 test("预设值仍完整：project 不修改入参", () => {

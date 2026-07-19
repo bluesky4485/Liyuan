@@ -1519,8 +1519,8 @@ export default function roleplayExtension(pi: ExtensionAPI) {
 		return { messages };
 	});
 
-	// 预设采样参数：UI/预设常驻全套，发送时按渠道投影（对齐 ST openai.js generate_data）。
-	// 默认自定义中转只发核心 4 键，避免 top_k/repetition_penalty 打挂 Kimi 等严校验源。
+	// 预设采样参数：UI/预设常驻全套，发送时按渠道/模型投影（ST + Kimi 官方固定采样约束）。
+	// 自定义中转默认只发核心 4 键；kimi-k3/k2.5+ 等固定采样模型 profile=none 全剥。
 	pi.on("before_provider_request", async (event, ctx) => {
 		if (!rpMode || !preset || Object.keys(preset.samplers).length === 0) return undefined;
 		const payload = event.payload;

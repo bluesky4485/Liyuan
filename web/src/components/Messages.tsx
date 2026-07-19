@@ -60,24 +60,30 @@ export interface ChatMsg extends WireMsg {
 }
 
 export const TOOL_LABELS: Record<string, string> = {
-	lorebook_search: "检索世界书",
-	world_state_get: "核对世界状态",
-	world_state_update: "记录状态",
-	lorebook_write: "写入设定集",
+	lorebook_search: "检索设定",
+	world_state_get: "核对账本",
+	world_state_update: "记下变化",
+	lorebook_write: "固化设定",
+	codex_create: "建知识库",
+	codex_mount: "挂知识库",
+	codex_unmount: "卸知识库",
+	codex_write: "写入知识库",
 	show_image: "展示插图",
 	show_audio: "展示音频",
 	show_video: "展示视频",
-	show_html: "展示 HTML",
-	tts: "文生音",
+	show_html: "嵌入界面",
+	tts: "配音",
 	skill_save: "沉淀技能",
 	panel_write: "更新面板",
 	panel_read: "查看面板",
 	panel_close: "收起面板",
+	ask_director: "请你定夺",
+	assistant_run: "委托助手",
 	bash: "执行命令",
-	read: "读取文件",
-	write: "写入文件",
-	edit: "编辑文件",
-	grep: "检索文件内容",
+	read: "查阅",
+	write: "写入",
+	edit: "改写",
+	grep: "检索文件",
 	find: "查找文件",
 	ls: "列目录",
 };
@@ -93,6 +99,13 @@ export const toolLabel = (name: string) => {
 	}
 	return name;
 };
+
+/** 原始 JSON 参数不应出现在过程条主文案里 */
+function looksLikeRawArgs(detail: string): boolean {
+	const t = detail.trim();
+	if (!t) return false;
+	return (t.startsWith("{") || t.startsWith("[")) && /"\w+"\s*:/.test(t);
+}
 
 /** RP 排版：*动作* → 斜体，"对白"/“对白”/「对白」 → 着色。纯呈现，不改字符。 */
 function renderRp(text: string) {
@@ -187,9 +200,9 @@ export function RichContent({ text }: { text: string }) {
 }
 
 /** 模型思维链：折叠呈现（模型原始输出，与正文明确区隔） */
-export function ThinkingBlock({ text, live }: { text: string; live?: boolean }) {
+export function ThinkingBlock({ text, live, defaultOpen }: { text: string; live?: boolean; defaultOpen?: boolean }) {
 	return (
-		<details className="thinking">
+		<details className="thinking" open={live || defaultOpen ? true : undefined}>
 			<summary className={live ? "pulse" : undefined}>思维链{live ? "…" : ""}</summary>
 			<div className="thinking-body">
 				<Paragraphs text={text} />
@@ -198,23 +211,28 @@ export function ThinkingBlock({ text, live }: { text: string; live?: boolean }) 
 	);
 }
 
-/** 过程条单项（工具调用 / 结果 / 中间旁白）——折叠态与实时清单共用 */
+/** 过程条单项：旁白优先；工具步骤用中文标签 + 人话 detail（藏 JSON） */
 function ActivityItem({ a }: { a: WireActivity }) {
 	if (a.kind === "note") {
 		return <li className="ta-note">{a.detail}</li>;
 	}
 	if (a.kind === "tool_start") {
+		const label = toolLabel(a.name);
+		const detail = (a.detail ?? "").trim();
+		const human = detail && !looksLikeRawArgs(detail) ? detail : "";
 		return (
 			<li className="ta-call">
-				{toolLabel(a.name)}
-				{a.detail && <span className="ta-detail">{a.detail}</span>}
+				<span className="ta-label">{label}</span>
+				{human ? <span className="ta-detail">{human}</span> : <span className="ta-detail ta-detail-muted">进行中…</span>}
 			</li>
 		);
 	}
+	const detail = (a.detail ?? "").trim();
+	const human = detail && !looksLikeRawArgs(detail) ? detail : "";
 	return (
 		<li className={`ta-result ${a.isError ? "ta-error" : ""}`}>
-			{a.isError ? "出错" : "结果"}
-			{a.detail && <span className="ta-detail">{a.detail}</span>}
+			<span className="ta-label">{a.isError ? "未办成" : "已办完"}</span>
+			{human ? <span className="ta-detail">{human}</span> : null}
 		</li>
 	);
 }
@@ -222,14 +240,12 @@ function ActivityItem({ a }: { a: WireActivity }) {
 /** 过程条（收尾态）：整轮步骤收进一个折叠（codex 式过程-成品分离，成品平铺在外） */
 export function ActivityBar({ activities }: { activities: WireActivity[] }) {
 	if (activities.length === 0) return null;
-	const calls = activities.filter((a) => a.kind === "tool_start").length;
-	const notes = activities.filter((a) => a.kind === "note").length;
+	const steps = activities.filter((a) => a.kind === "tool_start" || a.kind === "note").length;
 	return (
 		<details className="turn-activity">
 			<summary>
 				过程
-				{calls > 0 && ` · 工具调用 ×${calls}`}
-				{notes > 0 && ` · 旁白 ×${notes}`}
+				{steps > 0 && ` · ${steps} 步`}
 			</summary>
 			<ul>
 				{activities.map((a, i) => (
@@ -553,10 +569,15 @@ export function Bubble({
 				<MsgAvatar src={avatarUrl} name={name} kind={isUser ? "user" : "char"} />
 				<span className={`msg-name ${isUser ? "" : "msg-name-char"}`}>{name}</span>
 				{msg.channel === "greeting" && <span className="chip">开场白</span>}
+				{!isUser && msg.unfinished && (
+					<span className="chip chip-unfinished" title="生成被中断；发送「继续」可接着写">
+						未完成
+					</span>
+				)}
 				{editing && <span className="chip chip-edit">编辑中</span>}
 				{floor !== undefined && <span className="floor">#{floor}</span>}
 			</div>
-			{msg.thinking && !editing && <ThinkingBlock text={msg.thinking} />}
+			{msg.thinking && !editing && <ThinkingBlock text={msg.thinking} defaultOpen={msg.unfinished === true} />}
 			{editing ? (
 				<div className="msg-edit-box">
 					<textarea

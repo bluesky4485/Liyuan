@@ -1,10 +1,14 @@
 /**
- * 预设采样参数 → 请求体投影（对齐 SillyTavern Chat Completion 行为）。
+ * 预设采样参数 → 请求体投影（对齐 SillyTavern Chat Completion 行为 + 厂商官方约束）。
  *
  * 哲学（与 ST public/scripts/openai.js generate_data 一致）：
  * - UI / 预设里温度、top_k、rep_pen 等**常驻全套**，原样保存在 preset.samplers；
  * - 真正发请求时按渠道 / 模型**投影**：核心 OpenAI 键默认带，扩展键只给认它们的源；
- * - 某些模型（o1/o3、kimi-k2.5…）会剥掉采样字段，不是「丢掉用户配置」。
+ * - 某些模型（o1/o3、Kimi k2.5+ / k3…）会剥掉采样字段，不是「丢掉用户配置」。
+ *
+ * Kimi 固定采样：官方 platform.kimi.ai models-overview 写明 k2.5/k2.6/k2.7/k3
+ * 的 temperature/top_p/penalties 固定，传其它值会 4xx；ST 目前仅特判 k2.5，
+ * 此处以官方为准覆盖 k3 等新模型（含 opencode 等中转上的同名 id）。
  *
  * 默认对未知自定义中转走 openai-core（与 ST 的 CUSTOM 默认一致：不盲塞 top_k）。
  */
@@ -77,14 +81,21 @@ function lower(s: string | undefined): string {
 	return (s ?? "").trim().toLowerCase();
 }
 
-/** 模型级：ST 对若干系列直接 delete 采样字段 */
+/**
+ * 模型级：不接受（或固定）采样参数 → 请求体完全不带。
+ * 匹配 id 本体与带前缀的中转名（如 moonshotai/kimi-k3、opencode 上的 kimi-k3）。
+ */
 export function modelForbidsSampling(modelId: string | undefined): boolean {
 	const id = lower(modelId);
 	if (!id) return false;
 	// OpenAI o 系列 / OpenRouter 上的 openai/o1…
 	if (/(^|\/)(o1|o3|o4)([.-]|$)/.test(id)) return true;
-	// Moonshot Kimi：kimi-k2.5 不接受采样（ST openai.js MOONSHOT 分支）
-	if (/kimi-k2\.5/.test(id)) return true;
+	// Kimi 固定采样族：
+	// - k2.5：ST openai.js MOONSHOT 分支 delete 四键
+	// - k2.6 / k2.7(-code) / k3：官方 models-overview「Cannot be modified / omit」
+	//   ST 尚未收录 k3，但官方传非固定值会 invalid_request_error
+	if (/kimi-k2\.(5|6|7)/.test(id)) return true;
+	if (/kimi-k3([.\-/]|$)/.test(id)) return true;
 	// gpt-5 非 chat-latest：ST 多数路径剥采样（简化对齐）
 	if (/gpt-5/.test(id) && !/chat-latest/.test(id) && !/gpt-5\.(1|2|3|4)/.test(id)) return true;
 	return false;
@@ -141,7 +152,8 @@ export function resolveSamplerProfile(target: SamplerTarget): SamplerProfile {
 	// DeepSeek 官方：ST 只动 top_p 下限，不追加 top_k
 	if (provider === "deepseek" || base.includes("deepseek")) return "openai-core";
 
-	// Moonshot / Kimi 渠道：非 k2.5 走核心键（k2.5 已在 modelForbidsSampling）
+	// Moonshot / Kimi 渠道：旧版 / 可调温模型走核心键
+	// （k2.5+、k3 等固定采样模型已在 modelForbidsSampling → none）
 	if (
 		provider === "moonshotai" ||
 		provider === "moonshotai-cn" ||
@@ -292,6 +304,7 @@ export function applyProjectedSamplers(
 	target: SamplerTarget = {},
 ): Record<string, unknown> {
 	const projected = projectSamplers(samplers, target);
+	const profile = resolveSamplerProfile(target);
 	const out: Record<string, unknown> = { ...payload };
 
 	for (const key of Object.keys(samplers)) {
@@ -300,6 +313,12 @@ export function applyProjectedSamplers(
 	// 扩展键即使预设没写，也不该在 openai-core 渠道残留
 	for (const key of EXTENDED_SAMPLER_KEYS) {
 		if (!(key in projected)) delete out[key];
+	}
+	// none：引擎/payload 里可能已有 temperature 等默认值，按官方要求一并剥离
+	if (profile === "none") {
+		for (const key of CORE_SAMPLER_KEYS) {
+			if (!(key in projected)) delete out[key];
+		}
 	}
 
 	return { ...out, ...projected };
